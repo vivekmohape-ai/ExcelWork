@@ -15,8 +15,8 @@ from excel_utils import (
 
 # Set page configuration with a premium icon and layout
 st.set_page_config(
-    page_title="Antigravity Payroll Automator",
-    page_icon="💸",
+    page_title=" Payroll Automator",
+    page_icon="💸💸💸",
     layout="wide",
     initial_sidebar_state="expanded"
 )
