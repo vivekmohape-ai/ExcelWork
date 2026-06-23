@@ -93,7 +93,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Main Application Layout
-st.markdown("<h1 class='header-gradient'>Antigravity Payroll Automator</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='header-gradient'>Payroll Automator</h1>", unsafe_allow_html=True)
 st.markdown("<p class='subheader-text'>Automated monthly payroll matching, calculations, and styled Excel generation.</p>", unsafe_allow_html=True)
 
 # Define path to default template file
