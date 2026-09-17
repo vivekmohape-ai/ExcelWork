@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 import io
 import re
+from datetime import datetime, date
 from copy import copy
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -177,9 +178,310 @@ def infer_month_year(
     return None
 
 
+
+def _normalize_employee_id_local(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return ""
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except (TypeError, ValueError):
+        pass
+    return text
+
+
+def _read_dataframe_source(source: Any, filename: Optional[str] = None) -> pd.DataFrame:
+    """Read an uploaded attendance/punch source as a dataframe."""
+    if isinstance(source, pd.DataFrame):
+        return source.copy()
+
+    if hasattr(source, "seek"):
+        try:
+            source.seek(0)
+        except Exception:
+            pass
+
+    name = (filename or getattr(source, "name", "") or "").lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(source)
+    return pd.read_excel(source, header=None)
+
+
+def _normalize_column_label(value: Any) -> str:
+    text = _normalize_header(value)
+    return text.replace(" ", "_")
+
+
+def _find_named_column(columns: Iterable[Any], aliases: Iterable[str]) -> Optional[int]:
+    normalized = [_normalize_column_label(c) for c in columns]
+    alias_set = {_normalize_column_label(a) for a in aliases}
+    for idx, value in enumerate(normalized):
+        if value in alias_set:
+            return idx
+    for idx, value in enumerate(normalized):
+        if any(alias in value for alias in alias_set):
+            return idx
+    return None
+
+
+def _coerce_date_key(value: Any) -> Optional[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
+    except Exception:
+        return None
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def _has_punch_value(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    text = str(value).strip().lower()
+    if not text or text in {"nan", "nat", "none", "null", "-", "--"}:
+        return False
+    return True
+
+
+def _looks_like_datetime_punch(value: Any) -> bool:
+    """Return True when a single timestamp cell contains an actual time-of-day."""
+    if value is None:
+        return False
+    if isinstance(value, datetime):
+        return not (value.hour == 0 and value.minute == 0 and value.second == 0)
+    text = str(value).strip()
+    if not text:
+        return False
+    return bool(re.search(r"\d{1,2}:\d{2}", text))
+
+
+def _extract_punch_days(source: Any, filename: Optional[str] = None) -> Dict[str, set[str]]:
+    """
+    Extract dates on which an employee has any punch evidence.
+
+    Supported layouts include:
+      Employee ID | Date | In Time | Out Time
+      Employee Code | Attendance Date | Punch In | Punch Out
+      Employee ID | DateTime | Punch Type | Punch Time
+      one row per punch event with Employee ID + timestamp
+
+    Business rule:
+      if either punch in OR punch out exists for a date, that date is PRESENT.
+    """
+    if source is None:
+        return {}
+
+    try:
+        df = _read_dataframe_source(source, filename)
+    except Exception:
+        return {}
+
+    if df.empty:
+        return {}
+
+    # Locate a header row for files that are exported with title rows above the data.
+    header_idx = 0
+    for ridx in range(min(len(df), 25)):
+        row = df.iloc[ridx].tolist()
+        norm = [_normalize_column_label(v) for v in row]
+        has_id = any(v in {"employee_id", "employee_code", "emp_code", "id", "code"} for v in norm)
+        has_date = any("date" in v or "time" in v or "timestamp" in v or "datetime" in v for v in norm)
+        if has_id and has_date:
+            header_idx = ridx
+            break
+
+    if header_idx != 0 or not all(isinstance(c, str) for c in df.columns):
+        df = df.iloc[header_idx:].copy()
+        df.columns = [str(v).strip() for v in df.iloc[0].tolist()]
+        df = df.iloc[1:].reset_index(drop=True)
+
+    columns = list(df.columns)
+    id_idx = _find_named_column(
+        columns,
+        ["Employee ID", "Employee Code", "Emp Code", "ID", "Code", "User ID", "User Code"],
+    )
+    name_idx = _find_named_column(columns, ["Employee Name", "Name", "User Name"])
+    date_idx = _find_named_column(
+        columns,
+        ["Date", "Attendance Date", "Punch Date", "Transaction Date", "Log Date", "Date Time", "Datetime", "Timestamp"],
+    )
+    in_idx = _find_named_column(
+        columns,
+        ["In Time", "Punch In", "PunchIn", "First In", "Check In", "Check-In", "Login", "InTime"],
+    )
+    out_idx = _find_named_column(
+        columns,
+        ["Out Time", "Punch Out", "PunchOut", "Last Out", "Check Out", "Check-Out", "Logout", "OutTime"],
+    )
+    punch_time_idx = _find_named_column(
+        columns,
+        ["Punch Time", "PunchTime", "Event Time", "Transaction Time", "Time"],
+    )
+    direction_idx = _find_named_column(
+        columns,
+        ["Punch Type", "Punch Direction", "Direction", "In Out", "Type"],
+    )
+
+    if id_idx is None or date_idx is None:
+        return {}
+
+    by_id: Dict[str, set[str]] = {}
+    for row in df.itertuples(index=False, name=None):
+        if id_idx >= len(row) or date_idx >= len(row):
+            continue
+        emp_id = _normalize_employee_id_local(row[id_idx])
+        if not emp_id:
+            continue
+
+        raw_date = row[date_idx]
+        date_key = _coerce_date_key(raw_date)
+        if not date_key:
+            continue
+
+        # Any In Time OR Out Time means the employee was present that day.
+        punch_found = False
+        if in_idx is not None and in_idx < len(row):
+            punch_found = punch_found or _has_punch_value(row[in_idx])
+        if out_idx is not None and out_idx < len(row):
+            punch_found = punch_found or _has_punch_value(row[out_idx])
+        if punch_time_idx is not None and punch_time_idx < len(row):
+            punch_found = punch_found or _has_punch_value(row[punch_time_idx])
+        if direction_idx is not None and direction_idx < len(row):
+            direction = str(row[direction_idx]).strip().lower()
+            punch_found = punch_found or direction in {
+                "in", "out", "punch in", "punch out",
+                "check in", "check out", "login", "logout",
+            }
+
+        # For one-row-per-event exports, a timestamp in the date/datetime field
+        # is itself punch evidence when explicit punch columns are absent.
+        if not punch_found and punch_time_idx is None and in_idx is None and out_idx is None:
+            punch_found = _looks_like_datetime_punch(row[date_idx])
+
+        if punch_found:
+            by_id.setdefault(emp_id, set()).add(date_key)
+
+    return by_id
+
+
+def apply_punch_evidence(
+    attendance_records: List[Dict[str, Any]],
+    punch_source: Any,
+    punch_filename: Optional[str] = None,
+    *,
+    punch_log_is_authoritative: bool = True,
+) -> Dict[str, set[str]]:
+    """Apply the missing-punch rule to attendance records in place.
+
+    For a full monthly punch export, the unique dates containing at least
+    one In or Out punch are authoritative: one punch on a date = 1 present day.
+    When a detailed daily attendance workbook also provides exact present dates,
+    those dates are unioned with punch dates so a one-sided punch can never turn
+    into an absence.
+    """
+    punch_days = _extract_punch_days(punch_source, punch_filename)
+    if not punch_days:
+        return {}
+
+    for record in attendance_records:
+        emp_id = _normalize_employee_id_local(record.get("employee_id"))
+        if not emp_id:
+            continue
+
+        dates = punch_days.get(emp_id, set())
+        detailed_present_dates = {
+            str(d) for d in (record.get("present_dates") or []) if d
+        }
+        combined_dates = detailed_present_dates | set(dates)
+
+        if not combined_dates:
+            record["punch_present_days"] = 0
+            record["punch_present_dates"] = ""
+            record["punch_rule_applied"] = False
+            continue
+
+        summary_days = float(record.get("days_present") or 0)
+        punch_day_count = float(len(dates))
+
+        if detailed_present_dates:
+            # Exact union is possible because the detailed daily source tells us
+            # which dates were already counted. One-sided punches turn an A into P.
+            corrected_days = float(len(combined_dates))
+            # Preserve half-day weighting only when the detailed source explicitly
+            # contains half-day statuses and there is no punch on those dates.
+            half_dates = {
+                str(d) for d in (record.get("half_present_dates") or []) if d
+            }
+            corrected_days -= 0.5 * len(half_dates - set(dates))
+            source_label = "daily attendance + punch evidence"
+        elif punch_log_is_authoritative:
+            # With only an aggregate summary there is no way to know date overlap.
+            # A full raw punch export is therefore authoritative when it is at
+            # least as complete as the summary. If it has fewer punch dates, keep
+            # the summary value and flag the discrepancy rather than risking an
+            # underpayment caused by an incomplete export.
+            if punch_day_count >= summary_days:
+                corrected_days = punch_day_count
+                source_label = "full raw punch log"
+            else:
+                corrected_days = summary_days
+                source_label = "attendance summary retained because punch log is lower"
+                record["punch_discrepancy"] = True
+                record["punch_discrepancy_note"] = (
+                    f"Punch log contains {int(punch_day_count)} unique punch date(s), "
+                    f"while the attendance summary contains {summary_days:g} present day(s). "
+                    "Check that the raw punch export is complete."
+                )
+        else:
+            # Do not guess. An exception-only punch file cannot safely be unioned
+            # with an aggregate monthly total because overlap is unknown.
+            corrected_days = summary_days
+            source_label = "attendance summary only"
+
+        if corrected_days != summary_days:
+            record["days_present_before_punch_rule"] = summary_days
+            record["days_present"] = corrected_days
+            record["punch_rule_applied"] = True
+            record["punch_rule_note"] = (
+                f"Present days recalculated using {source_label}. "
+                "Any date with either Punch In or Punch Out counts as 1 present day."
+            )
+        else:
+            record["punch_rule_applied"] = False
+
+        record["punch_present_days"] = int(punch_day_count)
+        record["punch_present_dates"] = ", ".join(sorted(dates))
+
+    return punch_days
+
+
 def parse_attendance_input(
     file_content: Any,
     filename: Optional[str] = None,
+    punch_source: Any = None,
+    punch_filename: Optional[str] = None,
+    *,
+    punch_log_is_authoritative: bool = True,
 ):
     """
     Parse both supported attendance workbook formats.
@@ -507,11 +809,40 @@ def parse_attendance_input(
                 ).strip()
 
         # -----------------------------------------------------
-        # Daily status fallback
+        # Daily status details and fallback
         # -----------------------------------------------------
 
+        present_dates: List[str] = []
+        half_present_dates: List[str] = []
+
+        for day, col_idx in sorted(
+            daily_columns.items()
+        ):
+            if col_idx >= len(row):
+                continue
+
+            raw_status = row.iloc[col_idx]
+            if pd.isna(raw_status):
+                continue
+
+            status = str(raw_status).strip().upper()
+            if month_year:
+                month_match = MONTH_PATTERN.search(str(month_year))
+                if month_match:
+                    month_number = list(calendar.month_name).index(month_match.group(1).capitalize())
+                    date_key = f"{int(month_match.group(2)):04d}-{month_number:02d}-{int(day):02d}"
+                else:
+                    date_key = str(day)
+            else:
+                date_key = str(day)
+
+            if status in {"P", "PRESENT"}:
+                present_dates.append(date_key)
+            elif status in {"½P", "1/2P", "0.5P", "HALF DAY", "HALF"}:
+                half_present_dates.append(date_key)
+
         if days_present is None:
-            present_total = 0.0
+            present_total = float(len(present_dates)) + (0.5 * len(half_present_dates))
 
             for day, col_idx in sorted(
                 daily_columns.items()
@@ -579,6 +910,8 @@ def parse_attendance_input(
                     absent_count or 0
                 ),
                 "absent_days": absent_days,
+                "present_dates": present_dates,
+                "half_present_dates": half_present_dates,
             }
         )
 
@@ -586,6 +919,15 @@ def parse_attendance_input(
         raise ValueError(
             "No attendance records were found."
         )
+
+    # Correct the monthly total using raw punch evidence when supplied.
+    # A single In or Out punch on a date counts as present for that date.
+    apply_punch_evidence(
+        records,
+        punch_source,
+        punch_filename=punch_filename,
+        punch_log_is_authoritative=punch_log_is_authoritative,
+    )
 
     return month_year, records
 
