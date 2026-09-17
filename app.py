@@ -1,608 +1,2020 @@
-import streamlit as st
-import pandas as pd
-import openpyxl
-import os
+
+from __future__ import annotations
+
 import io
-import difflib
 import re
+import difflib
+from typing import Any, Dict, List, Optional, Tuple
+
+import openpyxl
+import pandas as pd
+import streamlit as st
+
 from excel_utils import (
-    parse_attendance_input,
+    add_new_hire_to_section,
     analyze_template_sheet,
+    detect_workbook_month,
     get_days_in_month,
-    update_headers_in_sheet,
-    archive_previous_month_consultants
+    parse_attendance_input,
+    update_active_workbook_month,
+    archive_previous_month_consultants,
+)
+from identity import (
+    IDENTITY_SHEET_NAME,
+    STATUS_CONFLICT,
+    STATUS_MISSING_ATTENDANCE,
+    STATUS_NOT_PRESENT,
+    STATUS_REGISTERED,
+    STATUS_REGISTERED_NAME_VARIANT,
+    STATUS_REVIEW,
+    build_attendance_indexes,
+    ensure_identity_sheet,
+    load_identity_register,
+    normalize_employee_id,
+    normalize_name,
+    payroll_mapping_key,
+    resolve_template_rows,
+    upsert_identity_register,
+    validate_mapping_conflicts,
 )
 
-# Set page configuration with a premium icon and layout
+
+# ---------------------------------------------------------------------------
+# PAGE CONFIGURATION
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
-    page_title=" Payroll Automator",
+    page_title="Payroll Automator",
     page_icon="💸",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom premium CSS for HSL colors, Google Fonts, hover effects, and cards
-st.markdown("""
+
+# ---------------------------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------------------------
+
+DEFAULTS = {
+    "attendance_records": [],
+    "template_data": {},
+    "template_month": None,
+    "target_month": None,
+    "mapping_state": {},
+    "new_employees": [],
+    "generated_file": None,
+    "download_filename": None,
+    "attendance_key": None,
+    "template_key": None,
+    "identity_loaded": False,
+    "identity_register_count": 0,
+    "identity_conflicts": {},
+}
+
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ---------------------------------------------------------------------------
+# STYLE
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    
-    /* Global Styles */
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
-    }
-    
-    /* Main Gradient Header */
-    .header-gradient {
-        background: linear-gradient(135deg, #4f46e5 0%, #06b6d4 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-weight: 700;
-        font-size: 2.8rem;
-        margin-bottom: 0.5rem;
-    }
-    
-    .subheader-text {
-        color: #6b7280;
-        font-size: 1.1rem;
-        margin-bottom: 2rem;
-    }
-    
-    /* Styled Card Container */
-    .premium-card {
-        background: rgba(255, 255, 255, 0.7);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(229, 231, 235, 0.5);
-        border-radius: 12px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-        margin-bottom: 1rem;
-    }
-    
-    /* Custom buttons */
-    div.stButton > button {
-        background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
-        color: white;
-        border: none;
-        padding: 0.6rem 1.8rem;
-        border-radius: 8px;
-        font-weight: 600;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 10px rgba(99, 102, 241, 0.3);
-    }
-    div.stButton > button:hover {
-        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-        transform: translateY(-2px);
-        box-shadow: 0 6px 15px rgba(99, 102, 241, 0.4);
-    }
-    
-    /* Metric Card Styling */
-    .metric-value {
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: #1e1b4b;
-        margin-bottom: 0.2rem;
-    }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #4f46e5;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
+.header-gradient {
+    background: linear-gradient(135deg, #4f46e5 0%, #06b6d4 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 700;
+    font-size: 2.8rem;
+    margin-bottom: 0.5rem;
+}
+
+.subheader-text {
+    color: #6b7280;
+    font-size: 1.05rem;
+    margin-bottom: 1.5rem;
+}
+
+.status-card {
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    background: #f9fafb;
+    margin-bottom: 0.5rem;
+}
+
+.review-card {
+    padding: 1rem;
+    border-radius: 10px;
+    border: 1px solid #f59e0b;
+    background: #fffbeb;
+    margin-bottom: 0.75rem;
+}
+
+.ok-card {
+    padding: 1rem;
+    border-radius: 10px;
+    border: 1px solid #10b981;
+    background: #ecfdf5;
+    margin-bottom: 0.75rem;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# Main Application Layout
-st.markdown("<h1 class='header-gradient'>Payroll Automator</h1>", unsafe_allow_html=True)
-st.markdown("<p class='subheader-text'>Automated monthly payroll matching, calculations, and styled Excel generation.</p>", unsafe_allow_html=True)
 
-# Define path to default template file
-DEFAULT_TEMPLATE_PATH = r"C:\Users\rohit\OneDrive\Documents\Another idea\hr Attendance\files\MERGE FILE - PRINCE - Till APRIL 2026.xlsx"
+st.markdown(
+    "<h1 class='header-gradient'>Payroll Automator</h1>",
+    unsafe_allow_html=True,
+)
 
-# Initialize Session State Variables
-if "template_data" not in st.session_state:
-    st.session_state.template_data = None
-if "input_data" not in st.session_state:
-    st.session_state.input_data = None
-if "parsed_month" not in st.session_state:
-    st.session_state.parsed_month = None
-if "input_records" not in st.session_state:
-    st.session_state.input_records = []
-if "name_mappings" not in st.session_state:
-    st.session_state.name_mappings = {}
-if "new_employees" not in st.session_state:
-    st.session_state.new_employees = [] # List of dicts representing manually added employees
-if "generated_file" not in st.session_state:
-    st.session_state.generated_file = None
-if "download_filename" not in st.session_state:
-    st.session_state.download_filename = None
-if "last_attendance_key" not in st.session_state:
-    st.session_state.last_attendance_key = None
-if "last_template_key" not in st.session_state:
-    st.session_state.last_template_key = None
+st.markdown(
+    "<p class='subheader-text'>"
+    "Monthly payroll processing with persistent ESSL identity matching."
+    "</p>",
+    unsafe_allow_html=True,
+)
 
-# ----------------- SIDEBAR (CONFIGURATION) -----------------
-with st.sidebar:
-    st.markdown("### ⚙️ Payroll Configuration")
-    
-    # 1. Template File
-    st.markdown("**1. Select Template Excel File**")
-    template_option = st.radio(
-        "Template Source",
-        ["Use Default Template", "Upload Custom Template"],
-        label_visibility="collapsed"
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+NOT_PRESENT_VALUE = "__NOT_PRESENT__"
+
+
+def _source_bytes(source: Any) -> bytes:
+    if isinstance(source, str):
+        with open(source, "rb") as handle:
+            return handle.read()
+
+    if hasattr(source, "getvalue"):
+        return source.getvalue()
+
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source)
+
+    raise TypeError(
+        "Unsupported file source."
     )
-    
-    template_file_content = None
-    if template_option == "Use Default Template":
-        if os.path.exists(DEFAULT_TEMPLATE_PATH):
-            template_file_content = DEFAULT_TEMPLATE_PATH
-            st.success("Loaded default template.")
-        else:
-            st.error("Default template not found. Please upload manually.")
-    else:
-        uploaded_template = st.file_uploader("Upload Merge Template File", type=["xlsx"])
-        if uploaded_template:
-            template_file_content = uploaded_template
-            st.success("Uploaded custom template.")
-            
-    st.markdown("---")
-    
-    # 2. Input Attendance File
-    st.markdown("**2. Upload Monthly Attendance**")
-    uploaded_attendance = st.file_uploader(
-        "Upload input Excel with names and days present",
-        type=["xlsx", "xls"]
+
+
+def _load_workbook_from_source(
+    source: Any,
+    *,
+    read_only: bool,
+):
+    data = _source_bytes(source)
+
+    return openpyxl.load_workbook(
+        io.BytesIO(data),
+        read_only=read_only,
+        data_only=False,
     )
-    
-    st.markdown("---")
-    
-    # 3. Archiving Settings
-    st.markdown("**3. Historical Log Options**")
-    archive_enabled = st.checkbox("Archive previous month's consultants to AI - TDS", value=True)
-    
-    # 4. Download Center
-    if st.session_state.generated_file is not None:
-        st.markdown("---")
-        st.markdown("### 📥 Download Center")
-        st.download_button(
-            label="📥 Download Payroll Excel",
-            data=st.session_state.generated_file,
-            file_name=st.session_state.download_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="sidebar_download_button"
+
+
+def _template_sections(
+    wb,
+) -> Dict[str, List[Dict[str, Any]]]:
+    result: Dict[str, List[Dict[str, Any]]] = {}
+
+    for sheet_name in wb.sheetnames:
+
+        if sheet_name == "AI - TDS":
+            continue
+
+        if sheet_name == IDENTITY_SHEET_NAME:
+            continue
+
+        sections = analyze_template_sheet(
+            wb[sheet_name]
         )
 
-# ----------------- DATA LOADING AND PARSING -----------------
-if template_file_content and uploaded_attendance:
-    # Check for changes in uploaded files to reset states dynamically
-    attendance_key = (uploaded_attendance.name, uploaded_attendance.size)
-    if attendance_key != st.session_state.last_attendance_key:
-        print(f"DEBUG: Resetting state because attendance file changed from {st.session_state.last_attendance_key} to {attendance_key}")
-        st.session_state.last_attendance_key = attendance_key
-        st.session_state.input_data = None
-        st.session_state.parsed_month = None
-        st.session_state.input_records = []
-        st.session_state.generated_file = None
-        st.session_state.name_mappings = {}
-        st.session_state.new_employees = []
+        if sections:
+            result[sheet_name] = sections
 
-    if isinstance(template_file_content, str):
-        template_key = template_file_content
+    return result
+
+
+def _mapping_option_label(
+    record: Dict[str, Any],
+) -> str:
+    employee_id = normalize_employee_id(
+        record.get("employee_id")
+    )
+
+    name = str(
+        record.get("name") or ""
+    ).strip()
+
+    days = float(
+        record.get("days_present") or 0
+    )
+
+    return (
+        f"{employee_id} | {name} | "
+        f"{days:g} days"
+    )
+
+
+def _mapping_key_to_record(
+    attendance_records: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    result = {}
+
+    for record in attendance_records:
+        employee_id = normalize_employee_id(
+            record.get("employee_id")
+        )
+
+        if employee_id:
+            result[employee_id] = record
+
+    return result
+
+
+def _format_days(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "0"
+
+    if numeric.is_integer():
+        return str(int(numeric))
+
+    return f"{numeric:.2f}".rstrip("0").rstrip(".")
+
+
+def _initialize_mapping_state(
+    template_data,
+    attendance_records,
+    register,
+) -> Dict[str, Dict[str, Any]]:
+    resolved = resolve_template_rows(
+        template_data=template_data,
+        attendance_records=attendance_records,
+        register=register,
+    )
+
+    return {
+        mapping["mapping_key"]: mapping
+        for mapping in resolved
+    }
+
+
+def _mapping_is_blocking(
+    mapping: Dict[str, Any],
+) -> bool:
+    return bool(
+        mapping.get("needs_confirmation")
+        and not mapping.get("confirmed")
+    )
+
+
+def _render_identity_stats(
+    mappings: List[Dict[str, Any]],
+) -> None:
+    total = len(mappings)
+
+    id_matches = sum(
+        mapping["status"]
+        in {
+            STATUS_REGISTERED,
+            STATUS_REGISTERED_NAME_VARIANT,
+        }
+        for mapping in mappings
+        if mapping.get("confirmed")
+    )
+
+    exact_matches = sum(
+        mapping["status"] == "EXACT NAME MATCH"
+        and mapping.get("confirmed")
+        for mapping in mappings
+    )
+
+    reviews = sum(
+        _mapping_is_blocking(mapping)
+        for mapping in mappings
+    )
+
+    missing = sum(
+        mapping["status"]
+        == STATUS_MISSING_ATTENDANCE
+        for mapping in mappings
+    )
+
+    not_present = sum(
+        mapping["status"]
+        == STATUS_NOT_PRESENT
+        for mapping in mappings
+    )
+
+    conflicts = validate_mapping_conflicts(
+        mappings
+    )
+
+    cols = st.columns(6)
+
+    cols[0].metric(
+        "Payroll Rows",
+        total,
+    )
+
+    cols[1].metric(
+        "ID Matched",
+        id_matches,
+    )
+
+    cols[2].metric(
+        "Exact Name",
+        exact_matches,
+    )
+
+    cols[3].metric(
+        "Needs Review",
+        reviews,
+    )
+
+    cols[4].metric(
+        "Not Present",
+        not_present + missing,
+    )
+
+    cols[5].metric(
+        "ID Conflicts",
+        len(conflicts),
+    )
+
+
+def _current_selected_id(
+    mapping: Dict[str, Any],
+) -> str:
+    return normalize_employee_id(
+        mapping.get("essl_id")
+    )
+
+
+def _set_mapping_from_attendance(
+    mapping: Dict[str, Any],
+    employee_id: str,
+    attendance_by_id: Dict[str, Dict[str, Any]],
+    *,
+    user_confirmed: bool = False,
+) -> None:
+    employee_id = normalize_employee_id(
+        employee_id
+    )
+
+    mapping["essl_id"] = employee_id
+
+    if employee_id and employee_id in attendance_by_id:
+        record = attendance_by_id[
+            employee_id
+        ]
+
+        mapping["attendance_name"] = str(
+            record.get("name") or ""
+        ).strip()
+
+        mapping["days_present"] = float(
+            record.get("days_present") or 0
+        )
+
+        mapping["match_method"] = (
+            "user_confirmed"
+            if user_confirmed
+            else "selected_attendance_id"
+        )
+
+        mapping["status"] = (
+            "USER CONFIRMED"
+            if user_confirmed
+            else STATUS_REVIEW
+        )
+
+        mapping["confirmed"] = bool(
+            user_confirmed
+        )
+
+        mapping["needs_confirmation"] = (
+            not user_confirmed
+        )
+
+        mapping["note"] = (
+            "Selected by ESSL Employee ID."
+            if user_confirmed
+            else "Select 'Confirm Identity' to use this ID."
+        )
+
     else:
-        template_key = (template_file_content.name, template_file_content.size)
-        
-    if template_key != st.session_state.last_template_key:
-        print(f"DEBUG: Resetting state because template file changed from {st.session_state.last_template_key} to {template_key}")
-        st.session_state.last_template_key = template_key
-        st.session_state.template_data = None
-        st.session_state.generated_file = None
-        st.session_state.name_mappings = {}
-        st.session_state.new_employees = []
+        mapping["attendance_name"] = ""
+        mapping["days_present"] = 0.0
+        mapping["match_method"] = (
+            "no_attendance_match"
+        )
+        mapping["status"] = STATUS_NOT_PRESENT
+        mapping["confirmed"] = True
+        mapping["needs_confirmation"] = False
+        mapping["note"] = (
+            "No attendance identity selected."
+        )
 
-    # 1. Load the input attendance file and parse names/month
-    try:
-        if st.session_state.input_data is None or st.session_state.parsed_month is None:
-            # Parse only once or when inputs change
-            month, records = parse_attendance_input(uploaded_attendance)
-            st.session_state.parsed_month = month if month else "May 2026"
-            st.session_state.input_records = records
-            st.session_state.input_data = True
-    except Exception as e:
-        st.error(f"Error reading attendance file: {e}")
-        st.stop()
-        
-    # 2. Load template structure
-    try:
-        if st.session_state.template_data is None:
-            wb_temp = openpyxl.load_workbook(template_file_content, read_only=True)
-            sheet_sections = {}
-            for name in wb_temp.sheetnames:
-                if name == "AI - TDS":
-                    continue # Skip logs sheet
-                sheet = wb_temp[name]
-                sheet_sections[name] = analyze_template_sheet(sheet)
-            st.session_state.template_data = sheet_sections
-            wb_temp.close()
-    except Exception as e:
-        st.error(f"Error loading template details: {e}")
-        st.stop()
 
-    # 3. Global parameters & Month config in the UI
-    st.markdown("<div class='premium-card'>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        # Allow user to change parsed month/year
-        month_input = st.text_input("Target Payroll Month & Year", value=st.session_state.parsed_month)
-        if month_input != st.session_state.parsed_month:
-            print(f"DEBUG: Resetting generated file because month input changed from {st.session_state.parsed_month} to {month_input}")
-            st.session_state.parsed_month = month_input
-            st.session_state.generated_file = None
-    with col2:
-        total_days = get_days_in_month(st.session_state.parsed_month)
-        st.markdown(f"<div class='metric-label'>Total Days in Month</div><div class='metric-value'>{total_days}</div>", unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"<div class='metric-label'>Matched Records</div><div class='metric-value'>{len(st.session_state.input_records)}</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+def _render_mapping_row(
+    mapping: Dict[str, Any],
+    attendance_records: List[Dict[str, Any]],
+    attendance_by_id: Dict[str, Dict[str, Any]],
+) -> None:
+    key = mapping["mapping_key"]
 
-    # Prepare lists for mapping UI
-    attendance_names = [r["name"] for r in st.session_state.input_records]
-    
-    # ----------------- TABS SETUP -----------------
-    tab1, tab2, tab3 = st.tabs(["👥 Name Mapping & Joiners", "📊 Live Payroll Preview", "💾 Generate & Download Excel"])
-    
-    # ----------------- TAB 1: NAME MAPPING & JOINERS -----------------
-    with tab1:
-        st.markdown("### Map Attendance Sheet Names to Template Employees")
-        st.info("The application automatically suggests matching names. You can override these using the dropdown selectors below. Select 'Not Present' to set 0 days, or select 'Add as New' if they are new hires.")
-        
-        # We will loop sheet by sheet and show the matching interface
-        template_sheets = st.session_state.template_data
-        
-        for sheet_name, sections in template_sheets.items():
-            if not sections:
-                continue
-                
-            st.markdown(f"#### 🏢 Sheet: `{sheet_name}`")
-            
-            # Combine all employees and consultants in this sheet
-            for section in sections:
-                sec_type = "Employee" if section["type"] == "employee" else "Freelancer (TDS)"
-                st.markdown(f"**Section: {sec_type}**")
-                
-                rows_data = []
-                for emp in section["rows"]:
-                    emp_name = emp["name"]
-                    row_num = emp["row_num"]
-                    
-                    # Compute unique key for the employee row
-                    mapping_key = f"{sheet_name}_{section['type']}_{row_num}_{emp_name}"
-                    
-                    # Automatic recommendation
-                    if mapping_key not in st.session_state.name_mappings:
-                        # Try to find best match in attendance names
-                        best_matches = difflib.get_close_matches(emp_name, attendance_names, n=1, cutoff=0.7)
-                        if best_matches:
-                            st.session_state.name_mappings[mapping_key] = best_matches[0]
-                        else:
-                            # Try case-insensitive exact check
-                            lower_names = [n.lower() for n in attendance_names]
-                            if emp_name.lower() in lower_names:
-                                match_idx = lower_names.index(emp_name.lower())
-                                st.session_state.name_mappings[mapping_key] = attendance_names[match_idx]
-                            else:
-                                st.session_state.name_mappings[mapping_key] = "Not Present (0 Days)"
-                                
-                    current_mapped = st.session_state.name_mappings[mapping_key]
-                    
-                    # Display the mapping layout
-                    cols = st.columns([3, 1, 4])
-                    with cols[0]:
-                        st.markdown(f"👤 **{emp_name}** `(Template Row {row_num})`  \n*Designation: {emp['designation']} | Gross: {emp['gross_salary']}*")
-                    with cols[1]:
-                        st.markdown("➡️ maps to")
-                    with cols[2]:
-                        options = ["Not Present (0 Days)"] + attendance_names
-                        selected_mapped = st.selectbox(
-                            f"Mapped name for {emp_name} ({row_num})",
-                            options=options,
-                            index=options.index(current_mapped) if current_mapped in options else 0,
-                            key=f"select_{mapping_key}",
-                            label_visibility="collapsed"
+    current_id = _current_selected_id(
+        mapping
+    )
+
+    # Build options once.
+    option_values = [NOT_PRESENT_VALUE]
+    option_labels = {
+        NOT_PRESENT_VALUE:
+        "Not Present (0 Days)"
+    }
+
+    for record in attendance_records:
+        employee_id = normalize_employee_id(
+            record.get("employee_id")
+        )
+
+        if not employee_id:
+            continue
+
+        option_values.append(
+            employee_id
+        )
+
+        option_labels[
+            employee_id
+        ] = _mapping_option_label(
+            record
+        )
+
+    if current_id and current_id not in option_values:
+        current_id = ""
+
+    selected_value = st.selectbox(
+        "Attendance identity",
+        options=option_values,
+        index=(
+            option_values.index(
+                current_id
+            )
+            if current_id
+            else 0
+        ),
+        format_func=lambda value: option_labels.get(
+            value,
+            value,
+        ),
+        key=f"identity_select_{key}",
+        label_visibility="collapsed",
+    )
+
+    if selected_value == NOT_PRESENT_VALUE:
+        if mapping.get("essl_id"):
+            mapping["essl_id"] = ""
+            mapping["attendance_name"] = ""
+            mapping["days_present"] = 0.0
+            mapping["status"] = STATUS_NOT_PRESENT
+            mapping["match_method"] = (
+                "no_attendance_match"
+            )
+            mapping["confirmed"] = True
+            mapping["needs_confirmation"] = False
+            mapping["note"] = (
+                "No attendance record assigned."
+            )
+
+    elif selected_value != current_id:
+        # New selection always requires explicit confirmation unless
+        # the row is already backed by a persistent ID and the user
+        # has intentionally changed it.
+        _set_mapping_from_attendance(
+            mapping,
+            selected_value,
+            attendance_by_id,
+            user_confirmed=False,
+        )
+
+    status = mapping.get(
+        "status",
+        STATUS_NOT_PRESENT,
+    )
+
+    requires_confirmation = bool(
+        mapping.get("needs_confirmation")
+        and mapping.get("essl_id")
+    )
+
+    if requires_confirmation:
+        confirm_key = (
+            f"confirm_identity_{key}"
+        )
+
+        confirmed = st.checkbox(
+            "Confirm Identity",
+            value=bool(
+                mapping.get("confirmed")
+            ),
+            key=confirm_key,
+        )
+
+        if confirmed:
+            mapping["confirmed"] = True
+            mapping["needs_confirmation"] = False
+            mapping["status"] = (
+                "USER CONFIRMED"
+            )
+            mapping["match_method"] = (
+                "user_confirmed"
+            )
+            mapping["note"] = (
+                "Identity explicitly confirmed by user."
+            )
+        else:
+            mapping["confirmed"] = False
+            mapping["needs_confirmation"] = True
+
+    status = mapping.get(
+        "status",
+        STATUS_NOT_PRESENT,
+    )
+
+    sheet_name = mapping[
+        "sheet_name"
+    ]
+
+    section_type = mapping[
+        "section_type"
+    ]
+
+    row_num = mapping[
+        "row_num"
+    ]
+
+    payroll_name = mapping[
+        "payroll_name"
+    ]
+
+    payroll_code = mapping.get(
+        "payroll_code"
+    )
+
+    attendance_name = mapping.get(
+        "attendance_name"
+    )
+
+    essl_id = mapping.get(
+        "essl_id"
+    )
+
+    days_present = mapping.get(
+        "days_present",
+        0,
+    )
+
+    cols = st.columns(
+        [1.8, 2.0, 1.0, 1.8]
+    )
+
+    cols[0].markdown(
+        f"**{payroll_name}**  \n"
+        f"`{sheet_name}` · {section_type} · row {row_num}"
+    )
+
+    cols[1].markdown(
+        f"Payroll code: `{payroll_code or 'N/A'}`  \n"
+        f"ESSL ID: `{essl_id or 'None'}`"
+    )
+
+    cols[2].markdown(
+        f"**{_format_days(days_present)}**  \n"
+        f"days"
+    )
+
+    status_display = status
+
+    if status_display in {
+        STATUS_REVIEW,
+        "MULTIPLE ID CANDIDATES",
+    }:
+        cols[3].warning(
+            f"{status_display}"
+        )
+    elif status_display == STATUS_NOT_PRESENT:
+        cols[3].info(
+            "Not present"
+        )
+    else:
+        cols[3].success(
+            status_display
+        )
+
+    if attendance_name:
+        st.caption(
+            f"Attendance name: {attendance_name}"
+        )
+
+    note = mapping.get(
+        "note"
+    )
+
+    if note:
+        st.caption(
+            note
+        )
+
+    st.markdown(
+        "---"
+    )
+
+
+def _calculate_preview_rows(
+    template_data,
+    mappings_by_key,
+    total_days,
+    new_employees,
+):
+    rows = []
+
+    for sheet_name, sections in template_data.items():
+
+        for section in sections:
+
+            for emp in section.get(
+                "rows",
+                [],
+            ):
+
+                key = payroll_mapping_key(
+                    sheet_name,
+                    section["type"],
+                    emp["row_num"],
+                )
+
+                mapping = mappings_by_key.get(
+                    key,
+                    {},
+                )
+
+                if (
+                    mapping.get("confirmed")
+                    and mapping.get("essl_id")
+                ):
+                    days_present = float(
+                        mapping.get(
+                            "days_present",
+                            0,
                         )
-                        if selected_mapped != current_mapped:
-                            print(f"DEBUG: Resetting generated file because mapping changed for {mapping_key} from {current_mapped} to {selected_mapped}")
-                            st.session_state.name_mappings[mapping_key] = selected_mapped
-                            st.session_state.generated_file = None
-            st.markdown("---")
-            
-        # Add New Joiners Section
-        st.markdown("### ➕ Add New Employee/Freelancer")
-        st.markdown("If you have new hires in your input sheet who are not in the template, you can add them to a sheet below. The app will write them into the blank rows in that sheet and generate the formulas.")
-        
-        with st.form("new_employee_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                new_name = st.selectbox("Select name from input sheet", ["Select Name"] + sorted(attendance_names))
-            with col2:
-                target_sheet = st.selectbox("Add to Sheet", list(template_sheets.keys()))
-            with col3:
-                emp_type_choice = st.selectbox("Type", ["Employee", "Freelancer (TDS)"])
-                
-            col4, col5, col6 = st.columns(3)
-            with col4:
-                new_designation = st.text_input("Designation")
-            with col5:
-                new_branch = st.text_input("Branch / Function")
-            with col6:
-                new_gross = st.number_input("Gross Salary", min_value=0.0, step=100.0)
-                
-            submitted = st.form_submit_button("Add New Hire")
-            if submitted:
-                if new_name == "Select Name":
-                    st.error("Please select a name from the input list.")
-                elif not new_designation or not new_branch:
-                    st.error("Please fill in Designation and Branch/Function.")
+                        or 0
+                    )
                 else:
-                    st.session_state.new_employees.append({
-                        "name": new_name,
-                        "sheet": target_sheet,
-                        "type": "employee" if emp_type_choice == "Employee" else "consultant",
-                        "designation": new_designation,
-                        "branch": new_branch,
-                        "gross_salary": new_gross
-                    })
-                    st.session_state.generated_file = None
-                    st.success(f"Added {new_name} as new {emp_type_choice} in sheet {target_sheet}!")
-                    
-        # List manually added new employees
-        if st.session_state.new_employees:
-            st.markdown("##### New Joiners Added:")
-            for idx, ne in enumerate(st.session_state.new_employees):
-                st.write(f"• **{ne['name']}** ({ne['type'].capitalize()}) in `{ne['sheet']}` — Designation: {ne['designation']}, Gross: {ne['gross_salary']} "
-                         f"[ [Remove](javascript:void(0)) ]")
-                # Add a clear button for list
-            if st.button("Clear All New Joiners"):
-                st.session_state.new_employees = []
-                st.session_state.generated_file = None
+                    days_present = 0.0
+
+                gross = float(
+                    emp.get("gross_salary")
+                    or 0
+                )
+
+                prorated = (
+                    gross
+                    * (
+                        days_present
+                        / total_days
+                    )
+                    if total_days
+                    else 0
+                )
+
+                if section["type"] == "employee":
+
+                    deductions = 200.0
+
+                    net = (
+                        prorated
+                        - deductions
+                    )
+
+                    record_type = "Employee"
+
+                else:
+
+                    deductions = (
+                        prorated
+                        * 0.10
+                    )
+
+                    net = (
+                        prorated
+                        - deductions
+                    )
+
+                    record_type = (
+                        "Freelancer (TDS)"
+                    )
+
+                rows.append(
+                    {
+                        "Sheet": sheet_name,
+                        "Type": record_type,
+                        "Name": emp["name"],
+                        "ESSL ID": mapping.get(
+                            "essl_id",
+                            "",
+                        ),
+                        "Gross Base": gross,
+                        "Present Days": days_present,
+                        "Pro-rated Gross": round(
+                            prorated,
+                            2,
+                        ),
+                        "TDS / Prof Tax": round(
+                            deductions,
+                            2,
+                        ),
+                        "Net Salary": round(
+                            net,
+                            2,
+                        ),
+                    }
+                )
+
+    for hire in new_employees:
+
+        days_present = float(
+            hire.get(
+                "days_present",
+                0,
+            )
+            or 0
+        )
+
+        gross = float(
+            hire.get(
+                "gross_salary",
+                0,
+            )
+            or 0
+        )
+
+        prorated = (
+            gross
+            * (
+                days_present
+                / total_days
+            )
+            if total_days
+            else 0
+        )
+
+        if hire["type"] == "employee":
+            deductions = 200.0
+            net = prorated - deductions
+        else:
+            deductions = prorated * 0.10
+            net = prorated - deductions
+
+        rows.append(
+            {
+                "Sheet": hire["sheet"],
+                "Type": (
+                    f"New "
+                    f"{hire['type'].capitalize()}"
+                ),
+                "Name": hire["name"],
+                "ESSL ID": hire.get(
+                    "essl_id",
+                    "",
+                ),
+                "Gross Base": gross,
+                "Present Days": days_present,
+                "Pro-rated Gross": round(
+                    prorated,
+                    2,
+                ),
+                "TDS / Prof Tax": round(
+                    deductions,
+                    2,
+                ),
+                "Net Salary": round(
+                    net,
+                    2,
+                ),
+            }
+        )
+
+    return rows
+
+
+def _write_existing_rows(
+    wb,
+    template_data,
+    mappings_by_key,
+    total_days,
+):
+    attendance_updates = []
+
+    for sheet_name, sections in template_data.items():
+
+        ws = wb[sheet_name]
+
+        for section in sections:
+
+            for emp in section.get(
+                "rows",
+                [],
+            ):
+
+                key = payroll_mapping_key(
+                    sheet_name,
+                    section["type"],
+                    emp["row_num"],
+                )
+
+                mapping = mappings_by_key.get(
+                    key,
+                    {},
+                )
+
+                days_present = (
+                    float(
+                        mapping.get(
+                            "days_present",
+                            0,
+                        )
+                        or 0
+                    )
+                    if mapping.get("confirmed")
+                    else 0.0
+                )
+
+                row_num = int(
+                    emp["row_num"]
+                )
+
+                if section["type"] == "employee":
+
+                    # E = total days
+                    # F = present days
+                    ws.cell(
+                        row_num,
+                        5,
+                    ).value = total_days
+
+                    ws.cell(
+                        row_num,
+                        6,
+                    ).value = days_present
+
+                    # Clear loan / advance.
+                    ws.cell(
+                        row_num,
+                        19,
+                    ).value = None
+
+                else:
+
+                    # D = total days
+                    # E = present days
+                    ws.cell(
+                        row_num,
+                        4,
+                    ).value = total_days
+
+                    ws.cell(
+                        row_num,
+                        5,
+                    ).value = days_present
+
+                    # Clear loan / advance.
+                    ws.cell(
+                        row_num,
+                        15,
+                    ).value = None
+
+                attendance_updates.append(
+                    (
+                        sheet_name,
+                        section,
+                        emp,
+                        mapping,
+                    )
+                )
+
+    return attendance_updates
+
+
+def _collect_register_mappings(
+    template_data,
+    mappings_by_key,
+    new_hire_results,
+    payroll_month,
+):
+    mappings = []
+
+    for mapping in mappings_by_key.values():
+
+        if not mapping.get(
+            "confirmed"
+        ):
+            continue
+
+        essl_id = normalize_employee_id(
+            mapping.get("essl_id")
+        )
+
+        if not essl_id:
+            continue
+
+        mappings.append(
+            {
+                "essl_id": essl_id,
+                "attendance_name": mapping.get(
+                    "attendance_name",
+                    "",
+                ),
+                "sheet_name": mapping[
+                    "sheet_name"
+                ],
+                "section_type": mapping[
+                    "section_type"
+                ],
+                "row_num": mapping[
+                    "row_num"
+                ],
+                "payroll_code": mapping.get(
+                    "payroll_code"
+                ),
+                "payroll_name": mapping[
+                    "payroll_name"
+                ],
+                "match_method": mapping.get(
+                    "match_method",
+                    "user_confirmed",
+                ),
+                "confirmed": True,
+            }
+        )
+
+    for result in new_hire_results:
+
+        mappings.append(
+            {
+                "essl_id": normalize_employee_id(
+                    result["essl_id"]
+                ),
+                "attendance_name": result[
+                    "attendance_name"
+                ],
+                "sheet_name": result[
+                    "sheet_name"
+                ],
+                "section_type": result[
+                    "section_type"
+                ],
+                "row_num": result[
+                    "row_num"
+                ],
+                "payroll_code": result.get(
+                    "payroll_code"
+                ),
+                "payroll_name": result[
+                    "payroll_name"
+                ],
+                "match_method": "new_hire_confirmed",
+                "confirmed": True,
+            }
+        )
+
+    return mappings
+
+
+# ---------------------------------------------------------------------------
+# SIDEBAR INPUTS
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+
+    st.markdown(
+        "### Payroll Configuration"
+    )
+
+    st.markdown(
+        "**1. Upload Payroll Template**"
+    )
+
+    uploaded_template = st.file_uploader(
+        "Excel template",
+        type=["xlsx"],
+        key="template_uploader",
+    )
+
+    st.markdown("---")
+
+    st.markdown(
+        "**2. Upload Monthly Attendance**"
+    )
+
+    uploaded_attendance = st.file_uploader(
+        "Attendance workbook",
+        type=["xlsx", "xls"],
+        key="attendance_uploader",
+    )
+
+    st.markdown("---")
+
+    archive_enabled = st.checkbox(
+        "Archive previous month's consultants",
+        value=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# REQUIRE INPUTS
+# ---------------------------------------------------------------------------
+
+if (
+    uploaded_template is None
+    or uploaded_attendance is None
+):
+
+    st.info(
+        "Upload both the payroll template and the monthly attendance workbook."
+    )
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# FILE KEYS AND RESET
+# ---------------------------------------------------------------------------
+
+attendance_key = (
+    uploaded_attendance.name,
+    uploaded_attendance.size,
+)
+
+template_key = (
+    uploaded_template.name,
+    uploaded_template.size,
+)
+
+
+if attendance_key != st.session_state.attendance_key:
+
+    st.session_state.attendance_key = (
+        attendance_key
+    )
+
+    st.session_state.attendance_records = []
+
+    st.session_state.mapping_state = {}
+
+    st.session_state.new_employees = []
+
+    st.session_state.generated_file = None
+
+    st.session_state.download_filename = None
+
+
+if template_key != st.session_state.template_key:
+
+    st.session_state.template_key = (
+        template_key
+    )
+
+    st.session_state.template_data = {}
+
+    st.session_state.mapping_state = {}
+
+    st.session_state.new_employees = []
+
+    st.session_state.generated_file = None
+
+    st.session_state.download_filename = None
+
+
+# ---------------------------------------------------------------------------
+# LOAD ATTENDANCE
+# ---------------------------------------------------------------------------
+
+if not st.session_state.attendance_records:
+
+    try:
+
+        month_from_attendance, records = (
+            parse_attendance_input(
+                uploaded_attendance,
+                filename=uploaded_attendance.name,
+            )
+        )
+
+        st.session_state.attendance_records = (
+            records
+        )
+
+    except Exception as exc:
+
+        st.error(
+            f"Error reading attendance workbook: {exc}"
+        )
+
+        st.stop()
+
+
+attendance_records = (
+    st.session_state.attendance_records
+)
+
+
+# ---------------------------------------------------------------------------
+# LOAD TEMPLATE
+# ---------------------------------------------------------------------------
+
+try:
+
+    wb_preview = _load_workbook_from_source(
+        uploaded_template,
+        read_only=True,
+    )
+
+    template_data = _template_sections(
+        wb_preview
+    )
+
+    template_month = detect_workbook_month(
+        wb_preview
+    )
+
+    wb_preview.close()
+
+except Exception as exc:
+
+    st.error(
+        f"Error loading payroll template: {exc}"
+    )
+
+    st.stop()
+
+
+st.session_state.template_data = (
+    template_data
+)
+
+st.session_state.template_month = (
+    template_month
+)
+
+
+# ---------------------------------------------------------------------------
+# TARGET MONTH
+# ---------------------------------------------------------------------------
+
+default_month = (
+    st.session_state.target_month
+    or template_month
+)
+
+if not default_month:
+
+    month_from_filename = (
+        month_from_attendance
+        if "month_from_attendance" in locals()
+        else None
+    )
+
+    default_month = (
+        month_from_filename
+        or "August 2026"
+    )
+
+
+st.session_state.target_month = (
+    st.text_input(
+        "Target Payroll Month & Year",
+        value=default_month,
+        key="target_month_input",
+    )
+)
+
+
+total_days = get_days_in_month(
+    st.session_state.target_month
+)
+
+
+# ---------------------------------------------------------------------------
+# IDENTITY REGISTER
+# ---------------------------------------------------------------------------
+
+try:
+
+    wb_identity_preview = _load_workbook_from_source(
+        uploaded_template,
+        read_only=False,
+    )
+
+    identity_register = load_identity_register(
+        wb_identity_preview
+    )
+
+    wb_identity_preview.close()
+
+except Exception as exc:
+
+    st.error(
+        f"Error loading identity register: {exc}"
+    )
+
+    st.stop()
+
+
+st.session_state.identity_register_count = (
+    len(identity_register)
+)
+
+
+# ---------------------------------------------------------------------------
+# INITIALIZE IDENTITY MATCHING
+# ---------------------------------------------------------------------------
+
+if not st.session_state.mapping_state:
+
+    st.session_state.mapping_state = (
+        _initialize_mapping_state(
+            template_data=template_data,
+            attendance_records=attendance_records,
+            register=identity_register,
+        )
+    )
+
+
+mappings_by_key = (
+    st.session_state.mapping_state
+)
+
+mapping_list = list(
+    mappings_by_key.values()
+)
+
+
+# ---------------------------------------------------------------------------
+# TABS
+# ---------------------------------------------------------------------------
+
+tab_identity, tab_preview, tab_generate = (
+    st.tabs(
+        [
+            "Identity & Attendance",
+            "Payroll Preview",
+            "Generate & Download",
+        ]
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# TAB 1: IDENTITY & ATTENDANCE
+# ---------------------------------------------------------------------------
+
+with tab_identity:
+
+    st.subheader(
+        "Employee Identity & Attendance"
+    )
+
+    if identity_register:
+
+        st.success(
+            f"Persistent identity register loaded: "
+            f"{len(identity_register)} mapping(s)."
+        )
+
+    else:
+
+        st.info(
+            "This template does not yet contain an identity register. "
+            "Exact unique name matches are used only to initialize "
+            "the register. Name similarity suggestions require "
+            "explicit confirmation."
+        )
+
+    _render_identity_stats(
+        mapping_list
+    )
+
+    conflicts = validate_mapping_conflicts(
+        mapping_list
+    )
+
+    if conflicts:
+
+        st.error(
+            "The same ESSL Employee ID is assigned to multiple "
+            "payroll rows. Generation is blocked until the conflict "
+            "is resolved."
+        )
+
+    review_count = sum(
+        _mapping_is_blocking(mapping)
+        for mapping in mapping_list
+    )
+
+    if review_count:
+
+        st.warning(
+            f"{review_count} payroll row(s) require identity confirmation "
+            "before payroll can be generated."
+        )
+
+    st.markdown(
+        "### Identity Mapping"
+    )
+
+    attendance_by_id, _ = (
+        build_attendance_indexes(
+            attendance_records
+        )
+    )
+
+    for sheet_name, sections in (
+        template_data.items()
+    ):
+
+        st.markdown(
+            f"#### {sheet_name}"
+        )
+
+        for section in sections:
+
+            st.markdown(
+                f"**{section['type'].capitalize()}**"
+            )
+
+            for emp in section.get(
+                "rows",
+                [],
+            ):
+
+                key = payroll_mapping_key(
+                    sheet_name,
+                    section["type"],
+                    emp["row_num"],
+                )
+
+                mapping = mappings_by_key.get(
+                    key
+                )
+
+                if mapping is None:
+                    continue
+
+                _render_mapping_row(
+                    mapping,
+                    attendance_records,
+                    attendance_by_id,
+                )
+
+    # ---------------------------------------------------------
+    # UNASSIGNED ATTENDANCE
+    # ---------------------------------------------------------
+
+    confirmed_ids = {
+        normalize_employee_id(
+            mapping.get("essl_id")
+        )
+        for mapping in mapping_list
+        if mapping.get("confirmed")
+        and mapping.get("essl_id")
+    }
+
+    assigned_new_hire_ids = {
+        normalize_employee_id(
+            hire.get("essl_id")
+        )
+        for hire in st.session_state.new_employees
+        if hire.get("essl_id")
+    }
+
+    used_ids = (
+        confirmed_ids
+        | assigned_new_hire_ids
+    )
+
+    unassigned_records = [
+        record
+        for record in attendance_records
+        if normalize_employee_id(
+            record.get("employee_id")
+        )
+        not in used_ids
+    ]
+
+    st.markdown(
+        "### Unassigned Attendance Records"
+    )
+
+    st.caption(
+        "These ESSL records were not assigned to an existing payroll row."
+    )
+
+    if unassigned_records:
+
+        unassigned_df = pd.DataFrame(
+            [
+                {
+                    "ESSL ID": normalize_employee_id(
+                        record.get("employee_id")
+                    ),
+                    "Attendance Name": record.get(
+                        "name"
+                    ),
+                    "Days Present": record.get(
+                        "days_present"
+                    ),
+                }
+                for record in unassigned_records
+            ]
+        )
+
+        st.dataframe(
+            unassigned_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.success(
+            "All attendance identities are currently assigned or intentionally excluded."
+        )
+
+    # ---------------------------------------------------------
+    # NEW HIRE FORM
+    # ---------------------------------------------------------
+
+    st.markdown(
+        "### Add New Employee / Freelancer"
+    )
+
+    with st.form(
+        "new_hire_form"
+    ):
+
+        hire_options = [
+            NOT_PRESENT_VALUE
+        ]
+
+        hire_labels = {
+            NOT_PRESENT_VALUE:
+            "Select attendance record"
+        }
+
+        for record in unassigned_records:
+
+            employee_id = normalize_employee_id(
+                record.get("employee_id")
+            )
+
+            if not employee_id:
+                continue
+
+            hire_options.append(
+                employee_id
+            )
+
+            hire_labels[
+                employee_id
+            ] = _mapping_option_label(
+                record
+            )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+
+            hire_id = st.selectbox(
+                "Attendance identity",
+                hire_options,
+                format_func=lambda value: (
+                    hire_labels.get(
+                        value,
+                        value,
+                    )
+                ),
+            )
+
+        with col2:
+
+            target_sheet = st.selectbox(
+                "Payroll Sheet",
+                list(
+                    template_data.keys()
+                ),
+            )
+
+        with col3:
+
+            hire_type = st.selectbox(
+                "Type",
+                [
+                    "Employee",
+                    "Freelancer (TDS)",
+                ],
+            )
+
+        col4, col5, col6 = st.columns(3)
+
+        with col4:
+
+            designation = st.text_input(
+                "Designation"
+            )
+
+        with col5:
+
+            branch = st.text_input(
+                "Branch / Function"
+            )
+
+        with col6:
+
+            gross_salary = st.number_input(
+                "Gross Salary",
+                min_value=0.0,
+                step=100.0,
+            )
+
+        submitted = st.form_submit_button(
+            "Add New Hire"
+        )
+
+        if submitted:
+
+            if hire_id == NOT_PRESENT_VALUE:
+
+                st.error(
+                    "Select an attendance identity."
+                )
+
+            elif not designation.strip():
+
+                st.error(
+                    "Designation is required."
+                )
+
+            elif not branch.strip():
+
+                st.error(
+                    "Branch / Function is required."
+                )
+
+            else:
+
+                record = attendance_by_id[
+                    hire_id
+                ]
+
+                selected_type = (
+                    "employee"
+                    if hire_type
+                    == "Employee"
+                    else "consultant"
+                )
+
+                hire = {
+                    "essl_id": hire_id,
+                    "attendance_name": record[
+                        "name"
+                    ],
+                    "days_present": float(
+                        record.get(
+                            "days_present",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "sheet": target_sheet,
+                    "type": selected_type,
+                    "designation": designation.strip(),
+                    "branch": branch.strip(),
+                    "gross_salary": float(
+                        gross_salary
+                    ),
+                }
+
+                st.session_state.new_employees.append(
+                    hire
+                )
+
+                st.success(
+                    f"Added {record['name']} as a new hire."
+                )
+
                 st.rerun()
 
-    # ----------------- TAB 2: LIVE PAYROLL PREVIEW -----------------
-    with tab2:
-        st.markdown("### Payroll Calculations Preview")
-        st.info("Here is a live preview of the pro-rated calculations before exporting. Loan entries are ignored.")
-        
-        # Build mapping of input name to days present
-        attendance_days = {r["name"]: r["days_present"] for r in st.session_state.input_records}
-        
-        for sheet_name, sections in template_sheets.items():
-            if not sections:
-                continue
-                
-            st.markdown(f"#### 🏢 Sheet: `{sheet_name}`")
-            
-            preview_rows = []
-            
-            # Helper to calculate pro-rated columns
-            for section in sections:
-                for emp in section["rows"]:
-                    emp_name = emp["name"]
-                    row_num = emp["row_num"]
-                    mapping_key = f"{sheet_name}_{section['type']}_{row_num}_{emp_name}"
-                    
-                    mapped_name = st.session_state.name_mappings.get(mapping_key, "Not Present (0 Days)")
-                    days_present = attendance_days.get(mapped_name, 0.0) if mapped_name != "Not Present (0 Days)" else 0.0
-                    
-                    gross = float(emp["gross_salary"]) if emp["gross_salary"] else 0.0
-                    prorated = gross * (days_present / total_days)
-                    
-                    # Deductions and net
-                    if section["type"] == "employee":
-                        # Basic=40%, HRA=10%, Conveyance=15%, Misc=25%, Medical=1250, Other=10% - 1250
-                        basic = prorated * 0.40
-                        hra = prorated * 0.10
-                        conveyance = prorated * 0.15
-                        misc = prorated * 0.25
-                        medical = 1250.0
-                        other = (prorated * 0.10) - 1250.0
-                        gross_calc = basic + hra + conveyance + misc + medical + other # equals pro-rated gross
-                        deductions = 200.0 # Standard Prof Tax
-                        net = gross_calc - deductions
-                        record_type = "Employee"
-                    else:
-                        # Freelancer TDS 10%
-                        basic = prorated * 0.40
-                        hra = prorated * 0.10
-                        conveyance = prorated * 0.15
-                        misc = prorated * 0.25
-                        other = prorated * 0.10
-                        actual_gross = basic + hra + conveyance + misc + other
-                        deductions = actual_gross * 0.10 # TDS
-                        net = actual_gross - deductions
-                        record_type = "Freelancer (TDS)"
-                        
-                    preview_rows.append({
-                        "Type": record_type,
-                        "Name": emp_name,
-                        "Gross Base": gross,
-                        "Present Days": days_present,
-                        "Pro-rated Gross": round(prorated, 2),
-                        "TDS / Prof Tax": round(deductions, 2),
-                        "Net Salary": round(net, 2)
-                    })
-                    
-            # Also append manual new employees for preview
-            for ne in st.session_state.new_employees:
-                if ne["sheet"] == sheet_name:
-                    days_present = attendance_days.get(ne["name"], 0.0)
-                    gross = float(ne["gross_salary"])
-                    prorated = gross * (days_present / total_days)
-                    if ne["type"] == "employee":
-                        deductions = 200.0
-                        net = prorated - deductions
-                    else:
-                        deductions = prorated * 0.10
-                        net = prorated - deductions
-                    preview_rows.append({
-                        "Type": f"New {ne['type'].capitalize()}",
-                        "Name": ne["name"],
-                        "Gross Base": gross,
-                        "Present Days": days_present,
-                        "Pro-rated Gross": round(prorated, 2),
-                        "TDS / Prof Tax": round(deductions, 2),
-                        "Net Salary": round(net, 2)
-                    })
-                    
-            if preview_rows:
-                df_preview = pd.DataFrame(preview_rows)
-                st.dataframe(df_preview, use_container_width=True)
-            else:
-                st.write("No employees or consultants in this sheet.")
+    if st.session_state.new_employees:
 
-    # ----------------- TAB 3: GENERATE & DOWNLOAD -----------------
-    with tab3:
-        st.markdown("### Generate Monthly Spreadsheet")
-        st.write("Click the button below to process your payroll and download the generated styled Excel file.")
-        
-        # Load the month for title updating
-        old_month = "April 2026"
-        new_month = st.session_state.parsed_month
-        
-        st.warning(f"This will replace all references of **'{old_month}'** in sheet titles with **'{new_month}'** and set total days to **{total_days}**.")
-        
-        if st.button("Generate Payroll Excel"):
-            # Load template using openpyxl (data_only=False so we load the formulas)
-            with st.spinner("Generating Excel file..."):
-                try:
-                    # Determine workbook object depending on custom upload or default path
-                    if isinstance(template_file_content, str):
-                        wb = openpyxl.load_workbook(template_file_content, data_only=False)
-                    else:
-                        template_file_content.seek(0)
-                        wb = openpyxl.load_workbook(template_file_content, data_only=False)
-                        
-                    # 1. Update month strings in all sheets
-                    for s_name in wb.sheetnames:
-                        update_headers_in_sheet(wb[s_name], old_month, new_month)
-                        
-                    # 2. Archive consultants if enabled
-                    if archive_enabled and "AI - TDS" in wb.sheetnames:
-                        archive_previous_month_consultants(wb, old_month)
-                        
-                    # Build attendance lookup
-                    attendance_days = {r["name"]: r["days_present"] for r in st.session_state.input_records}
-                    
-                    # 3. Process each sheet's employee and consultant values
-                    for sheet_name, sections in st.session_state.template_data.items():
-                        sheet = wb[sheet_name]
-                        
-                        # Process existing employees
-                        for section in sections:
-                            for emp in section["rows"]:
-                                emp_name = emp["name"]
-                                row_num = emp["row_num"]
-                                mapping_key = f"{sheet_name}_{section['type']}_{row_num}_{emp_name}"
-                                
-                                mapped_name = st.session_state.name_mappings.get(mapping_key, "Not Present (0 Days)")
-                                days_present = attendance_days.get(mapped_name, 0.0) if mapped_name != "Not Present (0 Days)" else 0.0
-                                
-                                # Write to sheet
-                                if section["type"] == "employee":
-                                    # Employee: Col E is Total Days, Col F is Days Present
-                                    sheet.cell(row=row_num, column=5).value = total_days
-                                    sheet.cell(row=row_num, column=6).value = days_present
-                                    # Clear Loan/Advance: Col S (19)
-                                    sheet.cell(row=row_num, column=19).value = None
-                                else:
-                                    # Consultant: Col D is Total Days, Col E is Days Present
-                                    sheet.cell(row=row_num, column=4).value = total_days
-                                    sheet.cell(row=row_num, column=5).value = days_present
-                                    # Clear Loan/Advance: Col O (15)
-                                    sheet.cell(row=row_num, column=15).value = None
-                                    
-                        # Process new joiners added to this sheet
-                        sheet_new_hires = [ne for ne in st.session_state.new_employees if ne["sheet"] == sheet_name]
-                        if sheet_new_hires:
-                            for ne in sheet_new_hires:
-                                target_sec = None
-                                for sec in sections:
-                                    if sec["type"] == ne["type"]:
-                                        target_sec = sec
-                                        break
-                                        
-                                if target_sec:
-                                    empty_row = None
-                                    for r_idx in range(target_sec["start_row"], target_sec["end_row"] + 1):
-                                        name_val = sheet.cell(row=r_idx, column=target_sec["name_col"]).value
-                                        if name_val is None or str(name_val).strip() == "":
-                                            empty_row = r_idx
-                                            break
-                                            
-                                    if empty_row:
-                                        prev_sr = sheet.cell(row=empty_row - 1, column=1).value
-                                        try:
-                                            sheet.cell(row=empty_row, column=1).value = int(prev_sr) + 1
-                                        except:
-                                            sheet.cell(row=empty_row, column=1).value = ""
-                                            
-                                        sheet.cell(row=empty_row, column=target_sec["name_col"]).value = ne["name"]
-                                        sheet.cell(row=empty_row, column=3).value = ne["designation"]
-                                        sheet.cell(row=empty_row, column=4).value = ne["branch"]
-                                        
-                                        days_present = attendance_days.get(ne["name"], 0.0)
-                                        
-                                        if ne["type"] == "employee":
-                                            sheet.cell(row=empty_row, column=5).value = total_days
-                                            sheet.cell(row=empty_row, column=6).value = days_present
-                                            sheet.cell(row=empty_row, column=7).value = ne["gross_salary"]
-                                            sheet.cell(row=empty_row, column=19).value = None
-                                            for c in [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 22]:
-                                                cell_above = sheet.cell(row=empty_row - 1, column=c)
-                                                if cell_above.value and isinstance(cell_above.value, str) and cell_above.value.startswith('='):
-                                                    new_f = re.sub(rf'\b({empty_row - 1})\b', str(empty_row), cell_above.value)
-                                                    sheet.cell(row=empty_row, column=c).value = new_f
-                                                elif c == 12:
-                                                    sheet.cell(row=empty_row, column=12).value = 1250
-                                                elif c == 15:
-                                                    sheet.cell(row=empty_row, column=15).value = 1
-                                                elif c == 17:
-                                                    sheet.cell(row=empty_row, column=17).value = 200
-                                        else:
-                                            sheet.cell(row=empty_row, column=4).value = total_days
-                                            sheet.cell(row=empty_row, column=5).value = days_present
-                                            sheet.cell(row=empty_row, column=6).value = ne["gross_salary"]
-                                            sheet.cell(row=empty_row, column=15).value = None
-                                            for c in [7, 8, 9, 10, 11, 12, 13, 14, 16]:
-                                                cell_above = sheet.cell(row=empty_row - 1, column=c)
-                                                if cell_above.value and isinstance(cell_above.value, str) and cell_above.value.startswith('='):
-                                                    new_f = re.sub(rf'\b({empty_row - 1})\b', str(empty_row), cell_above.value)
-                                                    sheet.cell(row=empty_row, column=c).value = new_f
-                                                elif c == 13:
-                                                    sheet.cell(row=empty_row, column=13).value = 1
-                                    else:
-                                        st.warning(f"No blank rows available in `{sheet_name}` for new hire {ne['name']}.")
-                                        
-                    # Save output workbook to session state bytes
-                    buffer = io.BytesIO()
-                    wb.save(buffer)
-                    wb.close()
-                    
-                    st.session_state.generated_file = buffer.getvalue()
-                    st.session_state.download_filename = f"MERGE FILE - PRINCE - {new_month}.xlsx"
-                    st.success("Successfully generated payroll sheet! Click 'Download Generated Excel File' below to save it.")
-                except Exception as ex:
-                    st.error(f"Error generating payroll Excel: {ex}")
-                    
-        # Render the download button if the file has been generated
-        if st.session_state.generated_file is not None:
-            st.info("💡 You can download the generated file below, or from the **Download Center** in the sidebar if the tab refreshes.")
-            st.download_button(
-                label="📥 Download Generated Excel File",
-                data=st.session_state.generated_file,
-                file_name=st.session_state.download_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="main_download_button"
+        st.markdown(
+            "#### New Hires Pending"
+        )
+
+        for index, hire in enumerate(
+            st.session_state.new_employees,
+            start=1,
+        ):
+
+            st.write(
+                f"{index}. "
+                f"{hire['attendance_name']} "
+                f"(ESSL ID {hire['essl_id']}) "
+                f"→ {hire['sheet']} "
+                f"→ {hire['type']} "
+                f"→ {hire['days_present']} days"
             )
-else:
-    st.info("👋 Please upload your Monthly Attendance report and select your Template file in the sidebar to get started.")
 
+        if st.button(
+            "Clear New Hires"
+        ):
+
+            st.session_state.new_employees = []
+
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# TAB 2: PAYROLL PREVIEW
+# ---------------------------------------------------------------------------
+
+with tab_preview:
+
+    st.subheader(
+        "Payroll Calculations Preview"
+    )
+
+    st.caption(
+        "Only confirmed ESSL identities contribute attendance to payroll."
+    )
+
+    preview_rows = _calculate_preview_rows(
+        template_data=template_data,
+        mappings_by_key=mappings_by_key,
+        total_days=total_days,
+        new_employees=st.session_state.new_employees,
+    )
+
+    if preview_rows:
+
+        df_preview = pd.DataFrame(
+            preview_rows
+        )
+
+        st.dataframe(
+            df_preview,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info(
+            "No payroll rows available."
+        )
+
+
+# ---------------------------------------------------------------------------
+# TAB 3: GENERATE
+# ---------------------------------------------------------------------------
+
+with tab_generate:
+
+    st.subheader(
+        "Generate Monthly Payroll"
+    )
+
+    target_month = (
+        st.session_state.target_month
+    )
+
+    current_template_month = (
+        st.session_state.template_month
+    )
+
+    st.write(
+        f"Target month: **{target_month}**"
+    )
+
+    if current_template_month:
+
+        st.caption(
+            f"Template currently appears to be for "
+            f"**{current_template_month}**."
+        )
+
+    blocking_reviews = [
+        mapping
+        for mapping in mapping_list
+        if _mapping_is_blocking(mapping)
+    ]
+
+    conflicts = validate_mapping_conflicts(
+        mapping_list
+    )
+
+    if blocking_reviews:
+
+        st.error(
+            f"Resolve {len(blocking_reviews)} identity review(s) "
+            "before generating payroll."
+        )
+
+    if conflicts:
+
+        st.error(
+            "Resolve duplicate ESSL Employee ID assignments before generating payroll."
+        )
+
+    should_archive = bool(
+        archive_enabled
+        and current_template_month
+        and (
+            current_template_month
+            != target_month
+        )
+    )
+
+    if archive_enabled and not should_archive:
+
+        st.info(
+            "Consultant archiving is disabled for this run because "
+            "the uploaded template is already for the target month."
+        )
+
+    st.warning(
+        "The payroll workbook will be modified in memory and a new "
+        "downloadable workbook will be created. The uploaded template "
+        "file itself is never overwritten."
+    )
+
+    can_generate = (
+        not blocking_reviews
+        and not conflicts
+    )
+
+    if st.button(
+        "Generate Payroll Excel",
+        type="primary",
+        disabled=not can_generate,
+    ):
+
+        with st.spinner(
+            "Generating payroll workbook..."
+        ):
+
+            try:
+
+                wb = _load_workbook_from_source(
+                    uploaded_template,
+                    read_only=False,
+                )
+
+                # ---------------------------------------------------------
+                # 1. Archive previous month only when moving to a new
+                #    month.
+                # ---------------------------------------------------------
+
+                if should_archive:
+
+                    archive_previous_month_consultants(
+                        wb,
+                        current_template_month,
+                    )
+
+                # ---------------------------------------------------------
+                # 2. Update active month headers.
+                #    AI - TDS is intentionally excluded because it is
+                #    historical data.
+                # ---------------------------------------------------------
+
+                update_active_workbook_month(
+                    wb,
+                    target_month,
+                    skip_sheets={
+                        "AI - TDS",
+                        IDENTITY_SHEET_NAME,
+                    },
+                )
+
+                # ---------------------------------------------------------
+                # 3. Write attendance to existing rows.
+                # ---------------------------------------------------------
+
+                _write_existing_rows(
+                    wb=wb,
+                    template_data=template_data,
+                    mappings_by_key=mappings_by_key,
+                    total_days=total_days,
+                )
+
+                # ---------------------------------------------------------
+                # 4. Add new hires.
+                # ---------------------------------------------------------
+
+                new_hire_results = []
+
+                for hire in st.session_state.new_employees:
+
+                    sections = template_data.get(
+                        hire["sheet"],
+                        [],
+                    )
+
+                    target_section = next(
+                        (
+                            section
+                            for section in sections
+                            if section["type"]
+                            == hire["type"]
+                        ),
+                        None,
+                    )
+
+                    if target_section is None:
+
+                        raise ValueError(
+                            f"No {hire['type']} section exists "
+                            f"in sheet '{hire['sheet']}'."
+                        )
+
+                    inserted_row = add_new_hire_to_section(
+                        wb[hire["sheet"]],
+                        target_section,
+                        {
+                            "name": hire[
+                                "attendance_name"
+                            ],
+                            "designation": hire[
+                                "designation"
+                            ],
+                            "branch": hire[
+                                "branch"
+                            ],
+                            "gross_salary": hire[
+                                "gross_salary"
+                            ],
+                        },
+                        total_days=total_days,
+                        days_present=float(
+                            hire[
+                                "days_present"
+                            ]
+                        ),
+                    )
+
+                    if inserted_row is None:
+
+                        raise ValueError(
+                            f"No blank row available in "
+                            f"'{hire['sheet']}' for "
+                            f"{hire['attendance_name']}."
+                        )
+
+                    inserted_code = wb[
+                        hire["sheet"]
+                    ].cell(
+                        inserted_row,
+                        1,
+                    ).value
+
+                    new_hire_results.append(
+                        {
+                            "essl_id": hire[
+                                "essl_id"
+                            ],
+                            "attendance_name": hire[
+                                "attendance_name"
+                            ],
+                            "sheet_name": hire[
+                                "sheet"
+                            ],
+                            "section_type": hire[
+                                "type"
+                            ],
+                            "row_num": inserted_row,
+                            "payroll_code": inserted_code,
+                            "payroll_name": hire[
+                                "attendance_name"
+                            ],
+                        }
+                    )
+
+                # ---------------------------------------------------------
+                # 5. Persist identity register.
+                # ---------------------------------------------------------
+
+                register_mappings = (
+                    _collect_register_mappings(
+                        template_data=template_data,
+                        mappings_by_key=mappings_by_key,
+                        new_hire_results=new_hire_results,
+                        payroll_month=target_month,
+                    )
+                )
+
+                ensure_identity_sheet(
+                    wb
+                )
+
+                upsert_identity_register(
+                    wb,
+                    register_mappings,
+                    payroll_month=target_month,
+                )
+
+                # ---------------------------------------------------------
+                # 6. Ask Excel to recalculate formulas.
+                # ---------------------------------------------------------
+
+                try:
+                    wb.calculation.fullCalcOnLoad = True
+                    wb.calculation.forceFullCalc = True
+                    wb.calculation.calcMode = "auto"
+                except Exception:
+                    pass
+
+                # ---------------------------------------------------------
+                # 7. Save.
+                # ---------------------------------------------------------
+
+                output = io.BytesIO()
+
+                wb.save(
+                    output
+                )
+
+                wb.close()
+
+                output.seek(0)
+
+                st.session_state.generated_file = (
+                    output.getvalue()
+                )
+
+                safe_month = re.sub(
+                    r"[^A-Za-z0-9]+",
+                    "_",
+                    target_month,
+                ).strip("_")
+
+                st.session_state.download_filename = (
+                    f"Payroll_{safe_month}.xlsx"
+                )
+
+                st.success(
+                    "Payroll workbook generated successfully."
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    f"Error generating payroll workbook: {exc}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# DOWNLOAD
+# ---------------------------------------------------------------------------
+
+if (
+    st.session_state.generated_file
+    is not None
+):
+
+    st.markdown(
+        "### Download"
+    )
+
+    st.download_button(
+        "Download Generated Payroll Excel",
+        data=st.session_state.generated_file,
+        file_name=(
+            st.session_state.download_filename
+            or "Payroll_Output.xlsx"
+        ),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        key="final_download",
+    )
