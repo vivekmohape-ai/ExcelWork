@@ -2001,6 +2001,17 @@ def add_new_hire_to_section(
 def get_days_in_month(
     month_year_str: str,
 ) -> int:
+    """
+    Return the number of calendar days for a month/year string.
+
+    Supports both full month names and abbreviations:
+
+        August 2026
+        Aug 2026
+        September 2026
+        Sep 2026
+    """
+
     if not month_year_str:
         return 30
 
@@ -2009,14 +2020,39 @@ def get_days_in_month(
     )
 
     if not match:
-        return 30
+        raise ValueError(
+            f"Invalid month/year format: {month_year_str}"
+        )
 
-    month_name = (
-        match.group(1).lower()
+    month_text = (
+        match.group(1)
+        .strip()
+        .lower()
     )
 
     year = int(
         match.group(2)
+    )
+
+    month_aliases = {
+        "jan": "january",
+        "feb": "february",
+        "mar": "march",
+        "apr": "april",
+        "may": "may",
+        "jun": "june",
+        "jul": "july",
+        "aug": "august",
+        "sep": "september",
+        "sept": "september",
+        "oct": "october",
+        "nov": "november",
+        "dec": "december",
+    }
+
+    month_name = month_aliases.get(
+        month_text,
+        month_text,
     )
 
     month_number = list(
