@@ -1258,252 +1258,156 @@ def apply_leave_adjustments(
     mappings: Dict[str, Dict[str, Any]],
     leave_records: List[Dict[str, Any]],
     total_days: int,
+    opening_balances: Optional[Dict[str, float]] = None,
+    monthly_accrual: float = 2.0,
 ) -> Dict[str, int]:
+    """Apply the Leave / Comp Off second layer to ESSL payroll days.
+
+    ESSL payroll_present_days is already the corrected attendance value and
+    already includes paid Sundays, qualifying Saturdays, and public holidays.
+    This function therefore adds only paid leave and approved comp off.
+
+    Leave balance:
+        opening balance + monthly accrual = available balance
+        paid leave = min(approved leave, available balance)
+        unpaid leave = approved leave - paid leave
+        closing balance = available balance - paid leave
+
+    The Leave report contains aggregate counts rather than leave dates, so
+    overlap with dates already paid by the ESSL calendar policy cannot be
+    resolved from this report alone.
     """
-    Reconcile approved paid leave / comp off into payroll payable days.
-
-    Current Leave report is aggregate only, so individual leave dates
-    are not available for exact date overlap checking.
-
-    Calculation:
-
-        final_payable_days =
-            payroll_present_days
-            + approved_leaves
-            + approved_comp_offs
-
-    The result is capped at total calendar days in the month.
-
-    Unpaid leave is not added.
-
-    All source values are preserved in the mapping for audit.
-    """
-
+    opening_balances = opening_balances or {}
     matched = 0
     unmatched = 0
     adjusted = 0
 
     for mapping in mappings.values():
-        attendance_name = str(
-            mapping.get(
-                "attendance_name"
-            )
-            or ""
-        ).strip()
+        attendance_name = str(mapping.get("attendance_name") or "").strip()
+        payroll_name = str(mapping.get("payroll_name") or "").strip()
+        target_name = attendance_name or payroll_name
 
-        payroll_name = str(
-            mapping.get(
-                "payroll_name"
-            )
-            or ""
-        ).strip()
-
-        target_name = (
-            attendance_name
-            or payroll_name
-        )
-
-        (
-            leave_record,
-            match_method,
-            score,
-        ) = match_leave_record(
-            target_name,
-            leave_records,
+        leave_record, match_method, score = match_leave_record(
+            target_name, leave_records
         )
 
         base_payroll_days = float(
-            mapping.get(
-                "payroll_present_days"
-            )
-            if mapping.get(
-                "payroll_present_days"
-            ) is not None
-            else mapping.get(
-                "days_present"
-            )
-            or 0
+            mapping.get("payroll_present_days")
+            if mapping.get("payroll_present_days") is not None
+            else mapping.get("days_present") or 0
         )
+        mapping["payroll_present_days"] = base_payroll_days
 
-        mapping[
-            "payroll_present_days"
-        ] = base_payroll_days
-
-        mapping[
-            "approved_leaves"
-        ] = 0.0
-
-        mapping[
-            "approved_comp_offs"
-        ] = 0.0
-
-        mapping[
-            "unpaid_leaves"
-        ] = 0.0
-
-        mapping[
-            "leave_adjustment"
-        ] = 0.0
-
-        mapping[
-            "final_payable_days"
-        ] = base_payroll_days
-
-        mapping[
-            "leave_match_method"
-        ] = match_method
-
-        mapping[
-            "leave_match_score"
-        ] = score
-
-        mapping[
-            "leave_report_name"
-        ] = ""
-
-        mapping[
-            "leave_note"
-        ] = ""
+        # Reset all reconciliation fields on every run.
+        for key in (
+            "approved_leaves", "approved_comp_offs", "reported_unpaid_leaves",
+            "balance_based_unpaid_leaves", "unpaid_leaves",
+            "opening_leave_balance", "available_leave_balance",
+            "paid_leave_used", "closing_leave_balance",
+            "leave_adjustment", "comp_off_adjustment",
+        ):
+            mapping[key] = 0.0
+        mapping["monthly_leave_accrual"] = float(monthly_accrual)
+        mapping["final_payable_days"] = base_payroll_days
+        mapping["leave_match_method"] = match_method
+        mapping["leave_match_score"] = score
+        mapping["leave_report_name"] = ""
+        mapping["leave_note"] = ""
 
         if leave_record is None:
             unmatched += 1
-
             if match_method == "REVIEW":
-                mapping[
-                    "leave_note"
-                ] = (
-                    "Possible Leave report name match found, "
-                    "but it was not applied automatically."
+                mapping["leave_note"] = (
+                    "Possible Leave report name match found, but it was not "
+                    "applied automatically."
                 )
             elif match_method == "AMBIGUOUS EXACT NAME":
-                mapping[
-                    "leave_note"
-                ] = (
-                    "Multiple Leave report rows match this name."
+                mapping["leave_note"] = (
+                    "Multiple Leave report rows match this employee."
                 )
             else:
-                mapping[
-                    "leave_note"
-                ] = (
-                    "No matching Leave / Comp Off record found."
+                mapping["leave_note"] = (
+                    "No matching Leave / Comp Off record found. No leave "
+                    "adjustment applied."
                 )
-
-            mapping[
-                "days_present"
-            ] = base_payroll_days
-
+            mapping["days_present"] = base_payroll_days
             continue
 
         matched += 1
+        approved_leaves = float(leave_record.get("approved_leaves") or 0)
+        approved_comp_offs = float(leave_record.get("approved_comp_offs") or 0)
+        reported_unpaid = float(leave_record.get("unpaid_leaves") or 0)
 
-        approved_leaves = float(
-            leave_record.get(
-                "approved_leaves"
+        essl_id = _normalize_employee_id_local(mapping.get("essl_id"))
+        opening_balance = float(opening_balances.get(essl_id, 0.0))
+        available_balance = opening_balance + float(monthly_accrual)
+
+        paid_leave_used = min(approved_leaves, available_balance)
+        balance_based_unpaid = max(0.0, approved_leaves - paid_leave_used)
+        total_unpaid = max(reported_unpaid, balance_based_unpaid)
+        closing_balance = max(0.0, available_balance - paid_leave_used)
+
+        remaining_capacity = max(
+            0.0, float(total_days) - base_payroll_days
+        )
+        applied_leave = min(paid_leave_used, remaining_capacity)
+        remaining_capacity -= applied_leave
+        applied_comp_off = min(approved_comp_offs, remaining_capacity)
+
+        final_payable_days = min(
+            base_payroll_days + applied_leave + applied_comp_off,
+            float(total_days),
+        )
+
+        mapping.update({
+            "approved_leaves": approved_leaves,
+            "approved_comp_offs": approved_comp_offs,
+            "reported_unpaid_leaves": reported_unpaid,
+            "balance_based_unpaid_leaves": balance_based_unpaid,
+            "unpaid_leaves": total_unpaid,
+            "opening_leave_balance": opening_balance,
+            "available_leave_balance": available_balance,
+            "paid_leave_used": paid_leave_used,
+            "closing_leave_balance": closing_balance,
+            "leave_adjustment": applied_leave,
+            "comp_off_adjustment": applied_comp_off,
+            "final_payable_days": final_payable_days,
+            "leave_report_name": str(leave_record.get("name") or ""),
+            "days_present": final_payable_days,
+        })
+
+        mapping["leave_note"] = (
+            "Leave balance reconciliation applied. "
+            f"Opening balance={opening_balance:g}, "
+            f"monthly accrual={monthly_accrual:g}, "
+            f"available={available_balance:g}, "
+            f"approved={approved_leaves:g}, "
+            f"paid={paid_leave_used:g}, "
+            f"unpaid={total_unpaid:g}, "
+            f"closing balance={closing_balance:g}."
+        )
+        if reported_unpaid != balance_based_unpaid:
+            mapping["leave_note"] += (
+                " Reported unpaid leave differs from the balance-based calculation."
             )
-            or 0
-        )
-
-        approved_comp_offs = float(
-            leave_record.get(
-                "approved_comp_offs"
+        if applied_leave < paid_leave_used:
+            mapping["leave_note"] += (
+                " Paid leave was capped by remaining calendar-day capacity."
             )
-            or 0
-        )
-
-        unpaid_leaves = float(
-            leave_record.get(
-                "unpaid_leaves"
-            )
-            or 0
-        )
-
-        requested_adjustment = (
-            approved_leaves
-            + approved_comp_offs
-        )
-
-        maximum_allowed = max(
-            0.0,
-            float(total_days)
-            - base_payroll_days,
-        )
-
-        applied_adjustment = min(
-            requested_adjustment,
-            maximum_allowed,
-        )
-
-        final_payable_days = (
-            base_payroll_days
-            + applied_adjustment
-        )
-
-        mapping[
-            "approved_leaves"
-        ] = approved_leaves
-
-        mapping[
-            "approved_comp_offs"
-        ] = approved_comp_offs
-
-        mapping[
-            "unpaid_leaves"
-        ] = unpaid_leaves
-
-        mapping[
-            "leave_adjustment"
-        ] = applied_adjustment
-
-        mapping[
-            "final_payable_days"
-        ] = final_payable_days
-
-        mapping[
-            "leave_report_name"
-        ] = str(
-            leave_record.get(
-                "name"
-            )
-            or ""
-        )
-
-        mapping[
-            "leave_note"
-        ] = (
-            "Aggregate leave reconciliation applied. "
-            "The Leave report contains counts only, not leave dates, "
-            "so exact overlap with an already paid calendar date "
-            "cannot be determined."
-        )
-
-        if (
-            requested_adjustment
-            > applied_adjustment
-        ):
-            mapping[
-                "leave_note"
-            ] += (
-                f" Requested adjustment "
-                f"{requested_adjustment:g} day(s) was capped so "
-                f"payable days do not exceed {total_days}."
+        if applied_comp_off < approved_comp_offs:
+            mapping["leave_note"] += (
+                " Comp Off was capped by remaining calendar-day capacity."
             )
 
-        mapping[
-            "days_present"
-        ] = final_payable_days
-
-        if applied_adjustment > 0:
+        if applied_leave > 0 or applied_comp_off > 0:
             adjusted += 1
 
     return {
         "matched": matched,
         "unmatched": unmatched,
         "adjusted": adjusted,
-        "total_leave_records": len(
-            leave_records
-        ),
+        "total_leave_records": len(leave_records),
     }
-
 
 def detect_workbook_month(
     wb,
@@ -2001,17 +1905,6 @@ def add_new_hire_to_section(
 def get_days_in_month(
     month_year_str: str,
 ) -> int:
-    """
-    Return the number of calendar days for a month/year string.
-
-    Supports both full month names and abbreviations:
-
-        August 2026
-        Aug 2026
-        September 2026
-        Sep 2026
-    """
-
     if not month_year_str:
         return 30
 
@@ -2020,39 +1913,14 @@ def get_days_in_month(
     )
 
     if not match:
-        raise ValueError(
-            f"Invalid month/year format: {month_year_str}"
-        )
+        return 30
 
-    month_text = (
-        match.group(1)
-        .strip()
-        .lower()
+    month_name = (
+        match.group(1).lower()
     )
 
     year = int(
         match.group(2)
-    )
-
-    month_aliases = {
-        "jan": "january",
-        "feb": "february",
-        "mar": "march",
-        "apr": "april",
-        "may": "may",
-        "jun": "june",
-        "jul": "july",
-        "aug": "august",
-        "sep": "september",
-        "sept": "september",
-        "oct": "october",
-        "nov": "november",
-        "dec": "december",
-    }
-
-    month_name = month_aliases.get(
-        month_text,
-        month_text,
     )
 
     month_number = list(
