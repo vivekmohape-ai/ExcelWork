@@ -1,27 +1,27 @@
-
 from __future__ import annotations
 
 import calendar
+import difflib
 import io
 import re
-from datetime import datetime, date
 from copy import copy
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional
 
-import pandas as pd
 import openpyxl
-
+import pandas as pd
 from openpyxl.formula.translate import Translator
 
 
 MONTH_PATTERN = re.compile(
     r"\b"
     r"(january|february|march|april|may|june|july|august|september|"
-    r"october|november|december)"
+    r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)"
     r"\s*,?\s*"
     r"(20\d{2})\b",
     re.IGNORECASE,
 )
+
 
 HEADER_SYNONYMS = {
     "employee_id": {
@@ -36,13 +36,22 @@ HEADER_SYNONYMS = {
         "employee name",
         "name of employee",
         "employee",
-        "employee name",
         "name",
         "name of consultant",
         "consultant",
         "consultant name",
         "name of freelancer",
         "freelancer",
+    },
+    "essl_present_days": {
+        "essl present days",
+        "essl present",
+    },
+    "payroll_present_days": {
+        "payroll present days",
+        "payroll present",
+        "payable days",
+        "payroll payable days",
     },
     "days_present": {
         "days present",
@@ -60,10 +69,59 @@ HEADER_SYNONYMS = {
         "days absent",
         "absent",
         "a",
+        "essl absent count",
+    },
+    "payroll_unpaid_absent_days": {
+        "payroll unpaid absent days",
+        "unpaid absent days",
     },
     "absent_days": {
         "absent days",
         "absence days",
+        "essl absent days",
+    },
+    "payroll_unpaid_absent_dates": {
+        "payroll unpaid absent dates",
+        "unpaid absent dates",
+    },
+    "active_from": {
+        "active from",
+        "active start",
+        "join date",
+        "joining date",
+    },
+    "active_to": {
+        "active to",
+        "active end",
+    },
+}
+
+
+LEAVE_HEADER_ALIASES = {
+    "name": {
+        "name",
+        "employee name",
+        "employee",
+    },
+    "approved_leaves": {
+        "no of approved leaves",
+        "no. of approved leaves",
+        "approved leaves",
+        "approved leave",
+    },
+    "approved_comp_offs": {
+        "no of approved comp offs taken",
+        "no. of approved comp offs taken",
+        "approved comp offs taken",
+        "approved comp off taken",
+        "comp offs taken",
+        "comp off taken",
+    },
+    "unpaid_leaves": {
+        "no of unpaid leaves",
+        "no. of unpaid leaves",
+        "unpaid leaves",
+        "unpaid leave",
     },
 }
 
@@ -79,7 +137,9 @@ def _normalize_header(value: Any) -> str:
     return text
 
 
-def _find_header_columns(row: Iterable[Any]) -> Dict[str, int]:
+def _find_header_columns(
+    row: Iterable[Any],
+) -> Dict[str, int]:
     normalized = [
         _normalize_header(value)
         for value in row
@@ -95,16 +155,66 @@ def _find_header_columns(row: Iterable[Any]) -> Dict[str, int]:
             if field_name in columns:
                 continue
 
-            if value in variants:
+            normalized_variants = {
+                _normalize_header(alias)
+                for alias in variants
+            }
+
+            if value in normalized_variants:
                 columns[field_name] = idx
                 break
 
-            if field_name == "days_present" and (
-                "present" in value
-                or (
-                    "days" in value
-                    and "present" in value
-                )
+    return columns
+
+
+def _find_leave_header_columns(
+    row: Iterable[Any],
+) -> Dict[str, int]:
+    normalized = [
+        _normalize_header(value)
+        for value in row
+    ]
+
+    columns: Dict[str, int] = {}
+
+    for idx, value in enumerate(normalized):
+        if not value:
+            continue
+
+        for field_name, variants in LEAVE_HEADER_ALIASES.items():
+            if field_name in columns:
+                continue
+
+            normalized_variants = {
+                _normalize_header(alias)
+                for alias in variants
+            }
+
+            if value in normalized_variants:
+                columns[field_name] = idx
+                break
+
+            if (
+                field_name == "approved_leaves"
+                and "approved" in value
+                and "leave" in value
+            ):
+                columns[field_name] = idx
+                break
+
+            if (
+                field_name == "approved_comp_offs"
+                and "approved" in value
+                and "comp" in value
+                and "off" in value
+            ):
+                columns[field_name] = idx
+                break
+
+            if (
+                field_name == "unpaid_leaves"
+                and "unpaid" in value
+                and "leave" in value
             ):
                 columns[field_name] = idx
                 break
@@ -112,7 +222,9 @@ def _find_header_columns(row: Iterable[Any]) -> Dict[str, int]:
     return columns
 
 
-def _extract_month_year_from_value(value: Any) -> Optional[str]:
+def _extract_month_year_from_value(
+    value: Any,
+) -> Optional[str]:
     if value is None:
         return None
 
@@ -134,8 +246,7 @@ def infer_month_year(
     filename: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Infer target month/year from the uploaded attendance file
-    or its filename.
+    Infer month/year from filename, workbook cells, or sheet names.
     """
 
     if filename:
@@ -146,31 +257,45 @@ def infer_month_year(
             return month
 
     try:
-        if isinstance(file_content, (bytes, bytearray)):
+        if isinstance(
+            file_content,
+            (bytes, bytearray),
+        ):
             source = io.BytesIO(
                 file_content
             )
-        elif hasattr(
-            file_content,
-            "seek",
-        ):
-            file_content.seek(0)
-            source = file_content
         else:
             source = file_content
 
-        df = pd.read_excel(
-            source,
-            header=None,
-            nrows=20,
-        )
+        if source is None:
+            return None
 
-        for value in df.to_numpy().flatten():
+        if hasattr(source, "seek"):
+            source.seek(0)
+
+        xls = pd.ExcelFile(source)
+
+        for sheet_name in xls.sheet_names:
             month = _extract_month_year_from_value(
-                value
+                sheet_name.replace("_", " ")
             )
             if month:
                 return month
+
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(
+                xls,
+                sheet_name=sheet_name,
+                header=None,
+                nrows=30,
+            )
+
+            for value in df.to_numpy().flatten():
+                month = _extract_month_year_from_value(
+                    value
+                )
+                if month:
+                    return month
 
     except Exception:
         pass
@@ -178,29 +303,61 @@ def infer_month_year(
     return None
 
 
+def _coerce_numeric(
+    value: Any,
+) -> float:
+    if value is None:
+        return 0.0
 
-def _normalize_employee_id_local(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return 0.0
+    except Exception:
+        pass
+
+    try:
+        return float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
+
+
+def _normalize_employee_id_local(
+    value: Any,
+) -> str:
     if value is None:
         return ""
+
     try:
         if pd.isna(value):
             return ""
     except Exception:
         pass
+
     text = str(value).strip().replace(",", "")
+
     if not text:
         return ""
+
     try:
         number = float(text)
+
         if number.is_integer():
             return str(int(number))
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         pass
+
     return text
 
 
-def _read_dataframe_source(source: Any, filename: Optional[str] = None) -> pd.DataFrame:
-    """Read an uploaded attendance/punch source as a dataframe."""
+def _read_dataframe_source(
+    source: Any,
+) -> pd.DataFrame:
     if isinstance(source, pd.DataFrame):
         return source.copy()
 
@@ -210,311 +367,102 @@ def _read_dataframe_source(source: Any, filename: Optional[str] = None) -> pd.Da
         except Exception:
             pass
 
-    name = (filename or getattr(source, "name", "") or "").lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(source)
-    return pd.read_excel(source, header=None)
+    if isinstance(
+        source,
+        (bytes, bytearray),
+    ):
+        source = io.BytesIO(source)
+
+    return pd.read_excel(
+        source,
+        header=None,
+    )
 
 
-def _normalize_column_label(value: Any) -> str:
-    text = _normalize_header(value)
-    return text.replace(" ", "_")
+def _valid_attendance_row(
+    employee_id: str,
+    name: str,
+) -> bool:
+    """
+    Reject obvious ESSL system/default rows.
 
+    A genuine employee may have a numeric ESSL ID, but a name that is
+    entirely numeric is treated as a malformed/system row.
+    """
 
-def _find_named_column(columns: Iterable[Any], aliases: Iterable[str]) -> Optional[int]:
-    normalized = [_normalize_column_label(c) for c in columns]
-    alias_set = {_normalize_column_label(a) for a in aliases}
-    for idx, value in enumerate(normalized):
-        if value in alias_set:
-            return idx
-    for idx, value in enumerate(normalized):
-        if any(alias in value for alias in alias_set):
-            return idx
-    return None
-
-
-def _coerce_date_key(value: Any) -> Optional[str]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    try:
-        parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
-    except Exception:
-        return None
-    if pd.isna(parsed):
-        return None
-    return parsed.date().isoformat()
-
-
-def _has_punch_value(value: Any) -> bool:
-    if value is None:
+    if not employee_id or not name:
         return False
-    try:
-        if pd.isna(value):
-            return False
-    except Exception:
-        pass
-    text = str(value).strip().lower()
-    if not text or text in {"nan", "nat", "none", "null", "-", "--"}:
+
+    normalized_name = name.strip()
+
+    if normalized_name.isdigit():
         return False
+
+    if normalized_name.lower() in {
+        "total",
+        "department default",
+    }:
+        return False
+
     return True
 
 
-def _looks_like_datetime_punch(value: Any) -> bool:
-    """Return True when a single timestamp cell contains an actual time-of-day."""
+def _parse_day_column_header(
+    value: Any,
+) -> Optional[int]:
     if value is None:
-        return False
-    if isinstance(value, datetime):
-        return not (value.hour == 0 and value.minute == 0 and value.second == 0)
+        return None
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+        try:
+            day = int(value)
+
+            if 1 <= day <= 31:
+                return day
+        except Exception:
+            return None
+
     text = str(value).strip()
-    if not text:
-        return False
-    return bool(re.search(r"\d{1,2}:\d{2}", text))
 
-
-def _extract_punch_days(source: Any, filename: Optional[str] = None) -> Dict[str, set[str]]:
-    """
-    Extract dates on which an employee has any punch evidence.
-
-    Supported layouts include:
-      Employee ID | Date | In Time | Out Time
-      Employee Code | Attendance Date | Punch In | Punch Out
-      Employee ID | DateTime | Punch Type | Punch Time
-      one row per punch event with Employee ID + timestamp
-
-    Business rule:
-      if either punch in OR punch out exists for a date, that date is PRESENT.
-    """
-    if source is None:
-        return {}
-
-    try:
-        df = _read_dataframe_source(source, filename)
-    except Exception:
-        return {}
-
-    if df.empty:
-        return {}
-
-    # Locate a header row for files that are exported with title rows above the data.
-    header_idx = 0
-    for ridx in range(min(len(df), 25)):
-        row = df.iloc[ridx].tolist()
-        norm = [_normalize_column_label(v) for v in row]
-        has_id = any(v in {"employee_id", "employee_code", "emp_code", "id", "code"} for v in norm)
-        has_date = any("date" in v or "time" in v or "timestamp" in v or "datetime" in v for v in norm)
-        if has_id and has_date:
-            header_idx = ridx
-            break
-
-    if header_idx != 0 or not all(isinstance(c, str) for c in df.columns):
-        df = df.iloc[header_idx:].copy()
-        df.columns = [str(v).strip() for v in df.iloc[0].tolist()]
-        df = df.iloc[1:].reset_index(drop=True)
-
-    columns = list(df.columns)
-    id_idx = _find_named_column(
-        columns,
-        ["Employee ID", "Employee Code", "Emp Code", "ID", "Code", "User ID", "User Code"],
-    )
-    name_idx = _find_named_column(columns, ["Employee Name", "Name", "User Name"])
-    date_idx = _find_named_column(
-        columns,
-        ["Date", "Attendance Date", "Punch Date", "Transaction Date", "Log Date", "Date Time", "Datetime", "Timestamp"],
-    )
-    in_idx = _find_named_column(
-        columns,
-        ["In Time", "Punch In", "PunchIn", "First In", "Check In", "Check-In", "Login", "InTime"],
-    )
-    out_idx = _find_named_column(
-        columns,
-        ["Out Time", "Punch Out", "PunchOut", "Last Out", "Check Out", "Check-Out", "Logout", "OutTime"],
-    )
-    punch_time_idx = _find_named_column(
-        columns,
-        ["Punch Time", "PunchTime", "Event Time", "Transaction Time", "Time"],
-    )
-    direction_idx = _find_named_column(
-        columns,
-        ["Punch Type", "Punch Direction", "Direction", "In Out", "Type"],
+    match = re.fullmatch(
+        r"(?:day\s*)?(\d{1,2})",
+        text,
+        flags=re.IGNORECASE,
     )
 
-    if id_idx is None or date_idx is None:
-        return {}
+    if not match:
+        return None
 
-    by_id: Dict[str, set[str]] = {}
-    for row in df.itertuples(index=False, name=None):
-        if id_idx >= len(row) or date_idx >= len(row):
-            continue
-        emp_id = _normalize_employee_id_local(row[id_idx])
-        if not emp_id:
-            continue
+    day = int(match.group(1))
 
-        raw_date = row[date_idx]
-        date_key = _coerce_date_key(raw_date)
-        if not date_key:
-            continue
+    if 1 <= day <= 31:
+        return day
 
-        # Any In Time OR Out Time means the employee was present that day.
-        punch_found = False
-        if in_idx is not None and in_idx < len(row):
-            punch_found = punch_found or _has_punch_value(row[in_idx])
-        if out_idx is not None and out_idx < len(row):
-            punch_found = punch_found or _has_punch_value(row[out_idx])
-        if punch_time_idx is not None and punch_time_idx < len(row):
-            punch_found = punch_found or _has_punch_value(row[punch_time_idx])
-        if direction_idx is not None and direction_idx < len(row):
-            direction = str(row[direction_idx]).strip().lower()
-            punch_found = punch_found or direction in {
-                "in", "out", "punch in", "punch out",
-                "check in", "check out", "login", "logout",
-            }
-
-        # For one-row-per-event exports, a timestamp in the date/datetime field
-        # is itself punch evidence when explicit punch columns are absent.
-        if not punch_found and punch_time_idx is None and in_idx is None and out_idx is None:
-            punch_found = _looks_like_datetime_punch(row[date_idx])
-
-        if punch_found:
-            by_id.setdefault(emp_id, set()).add(date_key)
-
-    return by_id
-
-
-def apply_punch_evidence(
-    attendance_records: List[Dict[str, Any]],
-    punch_source: Any,
-    punch_filename: Optional[str] = None,
-    *,
-    punch_log_is_authoritative: bool = True,
-) -> Dict[str, set[str]]:
-    """Apply the missing-punch rule to attendance records in place.
-
-    For a full monthly punch export, the unique dates containing at least
-    one In or Out punch are authoritative: one punch on a date = 1 present day.
-    When a detailed daily attendance workbook also provides exact present dates,
-    those dates are unioned with punch dates so a one-sided punch can never turn
-    into an absence.
-    """
-    punch_days = _extract_punch_days(punch_source, punch_filename)
-    if not punch_days:
-        return {}
-
-    for record in attendance_records:
-        emp_id = _normalize_employee_id_local(record.get("employee_id"))
-        if not emp_id:
-            continue
-
-        dates = punch_days.get(emp_id, set())
-        detailed_present_dates = {
-            str(d) for d in (record.get("present_dates") or []) if d
-        }
-        combined_dates = detailed_present_dates | set(dates)
-
-        if not combined_dates:
-            record["punch_present_days"] = 0
-            record["punch_present_dates"] = ""
-            record["punch_rule_applied"] = False
-            continue
-
-        summary_days = float(record.get("days_present") or 0)
-        punch_day_count = float(len(dates))
-
-        if detailed_present_dates:
-            # Exact union is possible because the detailed daily source tells us
-            # which dates were already counted. One-sided punches turn an A into P.
-            corrected_days = float(len(combined_dates))
-            # Preserve half-day weighting only when the detailed source explicitly
-            # contains half-day statuses and there is no punch on those dates.
-            half_dates = {
-                str(d) for d in (record.get("half_present_dates") or []) if d
-            }
-            corrected_days -= 0.5 * len(half_dates - set(dates))
-            source_label = "daily attendance + punch evidence"
-        elif punch_log_is_authoritative:
-            # With only an aggregate summary there is no way to know date overlap.
-            # A full raw punch export is therefore authoritative when it is at
-            # least as complete as the summary. If it has fewer punch dates, keep
-            # the summary value and flag the discrepancy rather than risking an
-            # underpayment caused by an incomplete export.
-            if punch_day_count >= summary_days:
-                corrected_days = punch_day_count
-                source_label = "full raw punch log"
-            else:
-                corrected_days = summary_days
-                source_label = "attendance summary retained because punch log is lower"
-                record["punch_discrepancy"] = True
-                record["punch_discrepancy_note"] = (
-                    f"Punch log contains {int(punch_day_count)} unique punch date(s), "
-                    f"while the attendance summary contains {summary_days:g} present day(s). "
-                    "Check that the raw punch export is complete."
-                )
-        else:
-            # Do not guess. An exception-only punch file cannot safely be unioned
-            # with an aggregate monthly total because overlap is unknown.
-            corrected_days = summary_days
-            source_label = "attendance summary only"
-
-        if corrected_days != summary_days:
-            record["days_present_before_punch_rule"] = summary_days
-            record["days_present"] = corrected_days
-            record["punch_rule_applied"] = True
-            record["punch_rule_note"] = (
-                f"Present days recalculated using {source_label}. "
-                "Any date with either Punch In or Punch Out counts as 1 present day."
-            )
-        else:
-            record["punch_rule_applied"] = False
-
-        record["punch_present_days"] = int(punch_day_count)
-        record["punch_present_dates"] = ", ".join(sorted(dates))
-
-    return punch_days
+    return None
 
 
 def parse_attendance_input(
     file_content: Any,
     filename: Optional[str] = None,
-    punch_source: Any = None,
-    punch_filename: Optional[str] = None,
-    *,
-    punch_log_is_authoritative: bool = True,
 ):
     """
-    Parse both supported attendance workbook formats.
+    Parse the attendance Excel produced by the ESSL Extractor.
 
-    Supported format A:
+    Preferred new format:
 
         Employee ID
         Employee Name
-        Days Present
-        Absent Count
-
-    Supported format B:
-
-        Sr No.
-        Employee Code
-        Employee Name
-        1
-        2
+        ESSL Present Days
+        Payroll Present Days
         ...
-        31
+        Day 1 ... Day 31
 
-    Returns:
-
-        month_year,
-        records
-
-    Every record contains:
-
-        employee_id
-        name
-        days_present
-        absent_count
-        absent_days
+    Backward compatibility:
+        Days Present / Present Days is accepted when
+        Payroll Present Days is absent.
     """
 
     month_year = infer_month_year(
@@ -522,11 +470,16 @@ def parse_attendance_input(
         filename=filename,
     )
 
-    if hasattr(
-        file_content,
-        "seek",
-    ):
+    if hasattr(file_content, "seek"):
         file_content.seek(0)
+
+    if isinstance(
+        file_content,
+        (bytes, bytearray),
+    ):
+        file_content = io.BytesIO(
+            file_content
+        )
 
     df = pd.read_excel(
         file_content,
@@ -542,7 +495,7 @@ def parse_attendance_input(
     header_columns: Dict[str, int] = {}
 
     for row_idx in range(
-        min(len(df), 30)
+        min(len(df), 40)
     ):
         columns = _find_header_columns(
             df.iloc[row_idx].tolist()
@@ -551,8 +504,9 @@ def parse_attendance_input(
         if (
             "name" in columns
             and (
-                "days_present" in columns
-                or "employee_id" in columns
+                "employee_id" in columns
+                or "payroll_present_days" in columns
+                or "days_present" in columns
             )
         ):
             header_row_idx = row_idx
@@ -564,16 +518,20 @@ def parse_attendance_input(
             "Could not identify the attendance header row."
         )
 
-    # ---------------------------------------------------------
-    # Identify ID / name / days present columns
-    # ---------------------------------------------------------
-
     name_col = header_columns.get(
         "name"
     )
 
     id_col = header_columns.get(
         "employee_id"
+    )
+
+    essl_present_col = header_columns.get(
+        "essl_present_days"
+    )
+
+    payroll_present_col = header_columns.get(
+        "payroll_present_days"
     )
 
     days_present_col = header_columns.get(
@@ -584,8 +542,28 @@ def parse_attendance_input(
         "absent_count"
     )
 
+    payroll_unpaid_absent_col = (
+        header_columns.get(
+            "payroll_unpaid_absent_days"
+        )
+    )
+
     absent_days_col = header_columns.get(
         "absent_days"
+    )
+
+    payroll_unpaid_absent_dates_col = (
+        header_columns.get(
+            "payroll_unpaid_absent_dates"
+        )
+    )
+
+    active_from_col = header_columns.get(
+        "active_from"
+    )
+
+    active_to_col = header_columns.get(
+        "active_to"
     )
 
     if name_col is None:
@@ -593,46 +571,22 @@ def parse_attendance_input(
             "Attendance workbook does not contain an employee name column."
         )
 
-    # ---------------------------------------------------------
-    # Determine daily date/status columns
-    # ---------------------------------------------------------
-
-    daily_columns: Dict[int, int] = {}
-
     header_values = (
         df.iloc[header_row_idx]
         .tolist()
     )
 
+    daily_columns: Dict[int, int] = {}
+
     for col_idx, value in enumerate(
         header_values
     ):
-        if isinstance(
-            value,
-            (int, float),
-        ):
-            day = int(value)
-
-            if 1 <= day <= 31:
-                daily_columns[day] = col_idx
-            continue
-
-        text = str(
+        day = _parse_day_column_header(
             value
-        ).strip()
+        )
 
-        if re.fullmatch(
-            r"\d{1,2}",
-            text,
-        ):
-            day = int(text)
-
-            if 1 <= day <= 31:
-                daily_columns[day] = col_idx
-
-    # ---------------------------------------------------------
-    # Parse rows
-    # ---------------------------------------------------------
+        if day is not None:
+            daily_columns[day] = col_idx
 
     records: List[Dict[str, Any]] = []
 
@@ -642,11 +596,504 @@ def parse_attendance_input(
     ):
         row = df.iloc[row_idx]
 
-        raw_name = (
-            row.iloc[name_col]
-            if name_col < len(row)
-            else None
+        if name_col >= len(row):
+            continue
+
+        raw_name = row.iloc[name_col]
+
+        if pd.isna(raw_name):
+            continue
+
+        name = str(raw_name).strip()
+
+        if not name:
+            continue
+
+        if name.upper() in {
+            "TOTAL",
+            "DEPARTMENT DEFAULT",
+        }:
+            continue
+
+        if id_col is not None:
+            raw_id = (
+                row.iloc[id_col]
+                if id_col < len(row)
+                else None
+            )
+            employee_id = (
+                _normalize_employee_id_local(
+                    raw_id
+                )
+            )
+        else:
+            employee_id = ""
+
+        if not employee_id and len(row) > 1:
+            employee_id = (
+                _normalize_employee_id_local(
+                    row.iloc[1]
+                )
+            )
+
+        if not _valid_attendance_row(
+            employee_id,
+            name,
+        ):
+            continue
+
+        essl_present_days = None
+
+        if (
+            essl_present_col is not None
+            and essl_present_col < len(row)
+        ):
+            value = row.iloc[
+                essl_present_col
+            ]
+
+            if pd.notna(value):
+                essl_present_days = (
+                    _coerce_numeric(value)
+                )
+
+        payroll_present_days = None
+
+        if (
+            payroll_present_col is not None
+            and payroll_present_col < len(row)
+        ):
+            value = row.iloc[
+                payroll_present_col
+            ]
+
+            if pd.notna(value):
+                payroll_present_days = (
+                    _coerce_numeric(value)
+                )
+
+        # Backward compatibility with old output.
+        if payroll_present_days is None:
+            if days_present_col is not None and days_present_col < len(row):
+                value = row.iloc[
+                    days_present_col
+                ]
+
+                if pd.notna(value):
+                    payroll_present_days = (
+                        _coerce_numeric(value)
+                    )
+
+        if payroll_present_days is None:
+            raise ValueError(
+                f"Attendance row for '{name}' has no Payroll Present Days."
+            )
+
+        if essl_present_days is None:
+            essl_present_days = (
+                payroll_present_days
+            )
+
+        absent_count = 0.0
+
+        if (
+            absent_count_col is not None
+            and absent_count_col < len(row)
+        ):
+            absent_count = _coerce_numeric(
+                row.iloc[absent_count_col]
+            )
+
+        payroll_unpaid_absent_days = None
+
+        if (
+            payroll_unpaid_absent_col is not None
+            and payroll_unpaid_absent_col < len(row)
+        ):
+            value = row.iloc[
+                payroll_unpaid_absent_col
+            ]
+
+            if pd.notna(value):
+                payroll_unpaid_absent_days = (
+                    _coerce_numeric(value)
+                )
+
+        if payroll_unpaid_absent_days is None:
+            payroll_unpaid_absent_days = (
+                absent_count
+            )
+
+        absent_days = ""
+
+        if (
+            absent_days_col is not None
+            and absent_days_col < len(row)
+        ):
+            value = row.iloc[
+                absent_days_col
+            ]
+
+            if pd.notna(value):
+                absent_days = str(
+                    value
+                ).strip()
+
+        payroll_unpaid_absent_dates = ""
+
+        if (
+            payroll_unpaid_absent_dates_col is not None
+            and payroll_unpaid_absent_dates_col < len(row)
+        ):
+            value = row.iloc[
+                payroll_unpaid_absent_dates_col
+            ]
+
+            if pd.notna(value):
+                payroll_unpaid_absent_dates = (
+                    str(value).strip()
+                )
+
+        active_from = None
+        active_to = None
+
+        if (
+            active_from_col is not None
+            and active_from_col < len(row)
+        ):
+            value = row.iloc[
+                active_from_col
+            ]
+
+            if pd.notna(value):
+                active_from = (
+                    _coerce_numeric(value)
+                )
+
+        if (
+            active_to_col is not None
+            and active_to_col < len(row)
+        ):
+            value = row.iloc[
+                active_to_col
+            ]
+
+            if pd.notna(value):
+                active_to = (
+                    _coerce_numeric(value)
+                )
+
+        present_dates: List[str] = []
+        half_present_dates: List[str] = []
+
+        month_number = None
+        year_number = None
+
+        if month_year:
+            match = MONTH_PATTERN.search(
+                str(month_year)
+            )
+
+            if match:
+                month_text = match.group(1).lower()
+                month_aliases = {
+                    "jan": "january",
+                    "feb": "february",
+                    "mar": "march",
+                    "apr": "april",
+                    "may": "may",
+                    "jun": "june",
+                    "jul": "july",
+                    "aug": "august",
+                    "sep": "september",
+                    "sept": "september",
+                    "oct": "october",
+                    "nov": "november",
+                    "dec": "december",
+                }
+                month_name = month_aliases.get(
+                    month_text,
+                    month_text,
+                )
+                month_number = list(
+                    calendar.month_name
+                ).index(
+                    month_name.capitalize()
+                )
+                year_number = int(
+                    match.group(2)
+                )
+
+        for day, col_idx in sorted(
+            daily_columns.items()
+        ):
+            if col_idx >= len(row):
+                continue
+
+            raw_status = row.iloc[
+                col_idx
+            ]
+
+            if pd.isna(raw_status):
+                continue
+
+            status = str(
+                raw_status
+            ).strip().upper()
+
+            date_key = str(day)
+
+            if (
+                month_number is not None
+                and year_number is not None
+            ):
+                date_key = (
+                    f"{year_number:04d}-"
+                    f"{month_number:02d}-"
+                    f"{day:02d}"
+                )
+
+            if status in {
+                "P",
+                "PRESENT",
+            }:
+                present_dates.append(
+                    date_key
+                )
+
+            elif status in {
+                "½P",
+                "1/2P",
+                "0.5P",
+                "HALF DAY",
+                "HALF",
+            }:
+                half_present_dates.append(
+                    date_key
+                )
+
+        records.append(
+            {
+                "employee_id": employee_id,
+                "name": name,
+                "days_present": float(
+                    payroll_present_days
+                ),
+                "essl_present_days": float(
+                    essl_present_days
+                ),
+                "payroll_present_days": float(
+                    payroll_present_days
+                ),
+                "absent_count": float(
+                    absent_count
+                ),
+                "payroll_unpaid_absent_days": float(
+                    payroll_unpaid_absent_days
+                ),
+                "absent_days": absent_days,
+                "payroll_unpaid_absent_dates": (
+                    payroll_unpaid_absent_dates
+                ),
+                "active_from": active_from,
+                "active_to": active_to,
+                "present_dates": present_dates,
+                "half_present_dates": half_present_dates,
+            }
         )
+
+    if not records:
+        raise ValueError(
+            "No valid attendance records were found."
+        )
+
+    return month_year, records
+
+
+def _leave_name_normalized(
+    value: Any,
+) -> str:
+    text = str(
+        value or ""
+    ).strip().lower()
+    text = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+    return text
+
+
+def _leave_name_similarity(
+    a: str,
+    b: str,
+) -> float:
+    na = _leave_name_normalized(a)
+    nb = _leave_name_normalized(b)
+
+    if not na or not nb:
+        return 0.0
+
+    if na == nb:
+        return 1.0
+
+    ta = na.split()
+    tb = nb.split()
+
+    if (
+        ta
+        and tb
+        and ta[0] == tb[0]
+        and len(ta) >= 2
+        and len(tb) >= 2
+    ):
+        if (
+            len(ta[1]) == 1
+            and tb[1].startswith(ta[1])
+        ):
+            return 0.95
+
+        if (
+            len(tb[1]) == 1
+            and ta[1].startswith(tb[1])
+        ):
+            return 0.95
+
+    ratio = difflib.SequenceMatcher(
+        None,
+        na,
+        nb,
+    ).ratio()
+
+    token_a = set(ta)
+    token_b = set(tb)
+
+    overlap = 0.0
+
+    if token_a and token_b:
+        overlap = len(
+            token_a & token_b
+        ) / len(
+            token_a | token_b
+        )
+
+    first_name_bonus = (
+        0.10
+        if ta and tb and ta[0] == tb[0]
+        else 0.0
+    )
+
+    return min(
+        1.0,
+        ratio * 0.60
+        + overlap * 0.30
+        + first_name_bonus,
+    )
+
+
+def parse_leave_report(
+    file_content: Any,
+    filename: Optional[str] = None,
+):
+    """
+    Parse the current Leave / Comp Off report.
+
+    Exact source format supplied by the user:
+
+        Name
+        No. of Approved Leaves
+        No. of Approved Comp Offs Taken
+        No. of Unpaid Leaves
+
+    The report currently supplies aggregate counts, not leave dates.
+    """
+
+    month_year = infer_month_year(
+        file_content=file_content,
+        filename=filename,
+    )
+
+    if hasattr(file_content, "seek"):
+        file_content.seek(0)
+
+    if isinstance(
+        file_content,
+        (bytes, bytearray),
+    ):
+        file_content = io.BytesIO(
+            file_content
+        )
+
+    df = pd.read_excel(
+        file_content,
+        header=None,
+    )
+
+    if df.empty:
+        raise ValueError(
+            "Leave / Comp Off workbook is empty."
+        )
+
+    header_row_idx = None
+    header_columns: Dict[str, int] = {}
+
+    for row_idx in range(
+        min(len(df), 30)
+    ):
+        columns = _find_leave_header_columns(
+            df.iloc[row_idx].tolist()
+        )
+
+        if (
+            "name" in columns
+            and (
+                "approved_leaves" in columns
+                or "approved_comp_offs" in columns
+                or "unpaid_leaves" in columns
+            )
+        ):
+            header_row_idx = row_idx
+            header_columns = columns
+            break
+
+    if header_row_idx is None:
+        raise ValueError(
+            "Could not identify the Leave / Comp Off report header."
+        )
+
+    name_col = header_columns["name"]
+
+    approved_leaves_col = header_columns.get(
+        "approved_leaves"
+    )
+
+    approved_comp_offs_col = header_columns.get(
+        "approved_comp_offs"
+    )
+
+    unpaid_leaves_col = header_columns.get(
+        "unpaid_leaves"
+    )
+
+    records: List[Dict[str, Any]] = []
+
+    for row_idx in range(
+        header_row_idx + 1,
+        len(df),
+    ):
+        row = df.iloc[row_idx]
+
+        if name_col >= len(row):
+            continue
+
+        raw_name = row.iloc[
+            name_col
+        ]
 
         if pd.isna(raw_name):
             continue
@@ -658,278 +1105,404 @@ def parse_attendance_input(
         if not name:
             continue
 
-        # Skip subtotal / footer rows.
         if name.upper() in {
             "TOTAL",
-            "DEPARTMENT DEFAULT",
+            "GRAND TOTAL",
         }:
             continue
 
-        # -----------------------------------------------------
-        # Employee ID
-        # -----------------------------------------------------
-
-        if id_col is not None:
-            raw_id = (
-                row.iloc[id_col]
-                if id_col < len(row)
-                else None
-            )
-
-            if pd.isna(raw_id):
-                employee_id = ""
-            else:
-                text_id = str(
-                    raw_id
-                ).strip()
-
-                try:
-                    numeric_id = float(
-                        text_id
-                    )
-
-                    if numeric_id.is_integer():
-                        employee_id = str(
-                            int(numeric_id)
-                        )
-                    else:
-                        employee_id = text_id
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    employee_id = text_id
-
-        else:
-            # Old attendance format:
-            # employee code is normally column 2.
-            employee_id = ""
-
-        if not employee_id:
-            # Try the second column as an employee code.
-            if len(row) > 1:
-                raw_id = row.iloc[1]
-
-                if pd.notna(raw_id):
-                    text_id = str(
-                        raw_id
-                    ).strip()
-
-                    try:
-                        numeric_id = float(
-                            text_id
-                        )
-
-                        if numeric_id.is_integer():
-                            employee_id = str(
-                                int(numeric_id)
-                            )
-                        else:
-                            employee_id = text_id
-
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-                        employee_id = text_id
-
-        # -----------------------------------------------------
-        # Days present
-        # -----------------------------------------------------
-
-        days_present: Optional[float] = None
-
-        if days_present_col is not None:
-            raw_present = (
+        approved_leaves = (
+            _coerce_numeric(
                 row.iloc[
-                    days_present_col
+                    approved_leaves_col
                 ]
-                if days_present_col < len(row)
-                else None
             )
+            if (
+                approved_leaves_col is not None
+                and approved_leaves_col < len(row)
+            )
+            else 0.0
+        )
 
-            if pd.notna(raw_present):
-                try:
-                    days_present = float(
-                        raw_present
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    days_present = None
-
-        # -----------------------------------------------------
-        # Absent count
-        # -----------------------------------------------------
-
-        absent_count: Optional[float] = None
-
-        if absent_count_col is not None:
-            raw_absent = (
+        approved_comp_offs = (
+            _coerce_numeric(
                 row.iloc[
-                    absent_count_col
+                    approved_comp_offs_col
                 ]
-                if absent_count_col < len(row)
-                else None
             )
+            if (
+                approved_comp_offs_col is not None
+                and approved_comp_offs_col < len(row)
+            )
+            else 0.0
+        )
 
-            if pd.notna(raw_absent):
-                try:
-                    absent_count = float(
-                        raw_absent
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    absent_count = None
-
-        # -----------------------------------------------------
-        # Absent days
-        # -----------------------------------------------------
-
-        absent_days = ""
-
-        if absent_days_col is not None:
-            raw_absent_days = (
+        unpaid_leaves = (
+            _coerce_numeric(
                 row.iloc[
-                    absent_days_col
+                    unpaid_leaves_col
                 ]
-                if absent_days_col < len(row)
-                else None
             )
-
-            if pd.notna(
-                raw_absent_days
-            ):
-                absent_days = str(
-                    raw_absent_days
-                ).strip()
-
-        # -----------------------------------------------------
-        # Daily status details and fallback
-        # -----------------------------------------------------
-
-        present_dates: List[str] = []
-        half_present_dates: List[str] = []
-
-        for day, col_idx in sorted(
-            daily_columns.items()
-        ):
-            if col_idx >= len(row):
-                continue
-
-            raw_status = row.iloc[col_idx]
-            if pd.isna(raw_status):
-                continue
-
-            status = str(raw_status).strip().upper()
-            if month_year:
-                month_match = MONTH_PATTERN.search(str(month_year))
-                if month_match:
-                    month_number = list(calendar.month_name).index(month_match.group(1).capitalize())
-                    date_key = f"{int(month_match.group(2)):04d}-{month_number:02d}-{int(day):02d}"
-                else:
-                    date_key = str(day)
-            else:
-                date_key = str(day)
-
-            if status in {"P", "PRESENT"}:
-                present_dates.append(date_key)
-            elif status in {"½P", "1/2P", "0.5P", "HALF DAY", "HALF"}:
-                half_present_dates.append(date_key)
-
-        if days_present is None:
-            present_total = float(len(present_dates)) + (0.5 * len(half_present_dates))
-
-            for day, col_idx in sorted(
-                daily_columns.items()
-            ):
-                if col_idx >= len(row):
-                    continue
-
-                raw_status = row.iloc[
-                    col_idx
-                ]
-
-                if pd.isna(raw_status):
-                    continue
-
-                status = str(
-                    raw_status
-                ).strip().upper()
-
-                if status in {
-                    "P",
-                    "PRESENT",
-                }:
-                    present_total += 1.0
-
-                elif status in {
-                    "½P",
-                    "1/2P",
-                    "0.5P",
-                    "HALF DAY",
-                    "HALF",
-                }:
-                    present_total += 0.5
-
-            days_present = present_total
-
-        if absent_count is None:
-            if daily_columns:
-                absent_count = sum(
-                    1
-                    for _, col_idx in sorted(
-                        daily_columns.items()
-                    )
-                    if (
-                        col_idx < len(row)
-                        and pd.notna(
-                            row.iloc[col_idx]
-                        )
-                        and str(
-                            row.iloc[col_idx]
-                        ).strip().upper()
-                        == "A"
-                    )
-                )
-            else:
-                absent_count = 0.0
+            if (
+                unpaid_leaves_col is not None
+                and unpaid_leaves_col < len(row)
+            )
+            else 0.0
+        )
 
         records.append(
             {
-                "employee_id": employee_id,
                 "name": name,
-                "days_present": float(
-                    days_present or 0
-                ),
-                "absent_count": float(
-                    absent_count or 0
-                ),
-                "absent_days": absent_days,
-                "present_dates": present_dates,
-                "half_present_dates": half_present_dates,
+                "approved_leaves": approved_leaves,
+                "approved_comp_offs": approved_comp_offs,
+                "unpaid_leaves": unpaid_leaves,
             }
         )
 
     if not records:
         raise ValueError(
-            "No attendance records were found."
+            "No Leave / Comp Off records were found."
         )
 
-    # Correct the monthly total using raw punch evidence when supplied.
-    # A single In or Out punch on a date counts as present for that date.
-    apply_punch_evidence(
-        records,
-        punch_source,
-        punch_filename=punch_filename,
-        punch_log_is_authoritative=punch_log_is_authoritative,
+    return month_year, records
+
+
+def match_leave_record(
+    target_name: str,
+    leave_records: List[Dict[str, Any]],
+):
+    """
+    Return:
+
+        record, match_method, score
+
+    Fuzzy matches are only accepted when the best candidate is
+    sufficiently strong and clearly separated from the second best.
+    """
+
+    target = _leave_name_normalized(
+        target_name
     )
 
-    return month_year, records
+    if not target:
+        return None, "NO NAME", 0.0
+
+    exact = [
+        record
+        for record in leave_records
+        if _leave_name_normalized(
+            record.get("name")
+        ) == target
+    ]
+
+    if len(exact) == 1:
+        return exact[0], "EXACT NAME", 1.0
+
+    if len(exact) > 1:
+        return (
+            None,
+            "AMBIGUOUS EXACT NAME",
+            1.0,
+        )
+
+    candidates = []
+
+    for record in leave_records:
+        score = _leave_name_similarity(
+            target_name,
+            str(
+                record.get("name") or ""
+            ),
+        )
+
+        candidates.append(
+            (
+                score,
+                record,
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    if not candidates:
+        return None, "NOT FOUND", 0.0
+
+    best_score, best_record = candidates[0]
+
+    second_score = (
+        candidates[1][0]
+        if len(candidates) > 1
+        else 0.0
+    )
+
+    if (
+        best_score >= 0.90
+        and (
+            len(candidates) == 1
+            or best_score - second_score >= 0.05
+        )
+    ):
+        return (
+            best_record,
+            "NAME SIMILARITY",
+            best_score,
+        )
+
+    return None, "REVIEW", best_score
+
+
+def apply_leave_adjustments(
+    mappings: Dict[str, Dict[str, Any]],
+    leave_records: List[Dict[str, Any]],
+    total_days: int,
+) -> Dict[str, int]:
+    """
+    Reconcile approved paid leave / comp off into payroll payable days.
+
+    Current Leave report is aggregate only, so individual leave dates
+    are not available for exact date overlap checking.
+
+    Calculation:
+
+        final_payable_days =
+            payroll_present_days
+            + approved_leaves
+            + approved_comp_offs
+
+    The result is capped at total calendar days in the month.
+
+    Unpaid leave is not added.
+
+    All source values are preserved in the mapping for audit.
+    """
+
+    matched = 0
+    unmatched = 0
+    adjusted = 0
+
+    for mapping in mappings.values():
+        attendance_name = str(
+            mapping.get(
+                "attendance_name"
+            )
+            or ""
+        ).strip()
+
+        payroll_name = str(
+            mapping.get(
+                "payroll_name"
+            )
+            or ""
+        ).strip()
+
+        target_name = (
+            attendance_name
+            or payroll_name
+        )
+
+        (
+            leave_record,
+            match_method,
+            score,
+        ) = match_leave_record(
+            target_name,
+            leave_records,
+        )
+
+        base_payroll_days = float(
+            mapping.get(
+                "payroll_present_days"
+            )
+            if mapping.get(
+                "payroll_present_days"
+            ) is not None
+            else mapping.get(
+                "days_present"
+            )
+            or 0
+        )
+
+        mapping[
+            "payroll_present_days"
+        ] = base_payroll_days
+
+        mapping[
+            "approved_leaves"
+        ] = 0.0
+
+        mapping[
+            "approved_comp_offs"
+        ] = 0.0
+
+        mapping[
+            "unpaid_leaves"
+        ] = 0.0
+
+        mapping[
+            "leave_adjustment"
+        ] = 0.0
+
+        mapping[
+            "final_payable_days"
+        ] = base_payroll_days
+
+        mapping[
+            "leave_match_method"
+        ] = match_method
+
+        mapping[
+            "leave_match_score"
+        ] = score
+
+        mapping[
+            "leave_report_name"
+        ] = ""
+
+        mapping[
+            "leave_note"
+        ] = ""
+
+        if leave_record is None:
+            unmatched += 1
+
+            if match_method == "REVIEW":
+                mapping[
+                    "leave_note"
+                ] = (
+                    "Possible Leave report name match found, "
+                    "but it was not applied automatically."
+                )
+            elif match_method == "AMBIGUOUS EXACT NAME":
+                mapping[
+                    "leave_note"
+                ] = (
+                    "Multiple Leave report rows match this name."
+                )
+            else:
+                mapping[
+                    "leave_note"
+                ] = (
+                    "No matching Leave / Comp Off record found."
+                )
+
+            mapping[
+                "days_present"
+            ] = base_payroll_days
+
+            continue
+
+        matched += 1
+
+        approved_leaves = float(
+            leave_record.get(
+                "approved_leaves"
+            )
+            or 0
+        )
+
+        approved_comp_offs = float(
+            leave_record.get(
+                "approved_comp_offs"
+            )
+            or 0
+        )
+
+        unpaid_leaves = float(
+            leave_record.get(
+                "unpaid_leaves"
+            )
+            or 0
+        )
+
+        requested_adjustment = (
+            approved_leaves
+            + approved_comp_offs
+        )
+
+        maximum_allowed = max(
+            0.0,
+            float(total_days)
+            - base_payroll_days,
+        )
+
+        applied_adjustment = min(
+            requested_adjustment,
+            maximum_allowed,
+        )
+
+        final_payable_days = (
+            base_payroll_days
+            + applied_adjustment
+        )
+
+        mapping[
+            "approved_leaves"
+        ] = approved_leaves
+
+        mapping[
+            "approved_comp_offs"
+        ] = approved_comp_offs
+
+        mapping[
+            "unpaid_leaves"
+        ] = unpaid_leaves
+
+        mapping[
+            "leave_adjustment"
+        ] = applied_adjustment
+
+        mapping[
+            "final_payable_days"
+        ] = final_payable_days
+
+        mapping[
+            "leave_report_name"
+        ] = str(
+            leave_record.get(
+                "name"
+            )
+            or ""
+        )
+
+        mapping[
+            "leave_note"
+        ] = (
+            "Aggregate leave reconciliation applied. "
+            "The Leave report contains counts only, not leave dates, "
+            "so exact overlap with an already paid calendar date "
+            "cannot be determined."
+        )
+
+        if (
+            requested_adjustment
+            > applied_adjustment
+        ):
+            mapping[
+                "leave_note"
+            ] += (
+                f" Requested adjustment "
+                f"{requested_adjustment:g} day(s) was capped so "
+                f"payable days do not exceed {total_days}."
+            )
+
+        mapping[
+            "days_present"
+        ] = final_payable_days
+
+        if applied_adjustment > 0:
+            adjusted += 1
+
+    return {
+        "matched": matched,
+        "unmatched": unmatched,
+        "adjusted": adjusted,
+        "total_leave_records": len(
+            leave_records
+        ),
+    }
 
 
 def detect_workbook_month(
@@ -937,151 +1510,21 @@ def detect_workbook_month(
 ) -> Optional[str]:
     """
     Detect an existing payroll month/year from workbook text.
-    Searches titles and early rows.
     """
-
     for ws in wb.worksheets:
-
-        max_scan_row = min(
-            ws.max_row,
-            8,
-        )
-
-        max_scan_col = min(
-            ws.max_column,
-            8,
-        )
-
-        for r in range(
-            1,
-            max_scan_row + 1,
+        for row in ws.iter_rows(
+            min_row=1,
+            max_row=min(ws.max_row, 10),
+            min_col=1,
+            max_col=min(ws.max_column, 12),
         ):
-            for c in range(
-                1,
-                max_scan_col + 1,
-            ):
-                value = ws.cell(
-                    r,
-                    c,
-                ).value
-
-                month = (
-                    _extract_month_year_from_value(
-                        value
-                    )
+            for cell in row:
+                month = _extract_month_year_from_value(
+                    cell.value
                 )
-
                 if month:
                     return month
-
     return None
-
-
-def get_days_in_month(
-    month_year_str: str,
-) -> int:
-    """
-    Return calendar days for a month/year string.
-    """
-
-    if not month_year_str:
-        return 30
-
-    match = MONTH_PATTERN.search(
-        str(month_year_str)
-    )
-
-    if not match:
-        return 30
-
-    month_name = (
-        match.group(1).lower()
-    )
-
-    year = int(
-        match.group(2)
-    )
-
-    month_number = list(
-        calendar.month_name
-    ).index(
-        month_name.capitalize()
-    )
-
-    return calendar.monthrange(
-        year,
-        month_number,
-    )[1]
-
-
-def update_headers_in_sheet(
-    sheet,
-    old_month_str: Optional[str],
-    new_month_str: str,
-):
-    """
-    Compatibility function.
-
-    Replaces the old month/year wherever it occurs.
-    """
-
-    if old_month_str:
-        pattern = re.compile(
-            re.escape(old_month_str),
-            re.IGNORECASE,
-        )
-
-        alternate_old = (
-            old_month_str.replace(
-                " ",
-                ", ",
-            )
-        )
-
-        alternate_new = (
-            new_month_str.replace(
-                " ",
-                ", ",
-            )
-        )
-
-        alternate_pattern = re.compile(
-            re.escape(alternate_old),
-            re.IGNORECASE,
-        )
-
-    else:
-        pattern = None
-        alternate_pattern = None
-        alternate_new = new_month_str
-
-    for row in sheet.iter_rows():
-
-        for cell in row:
-
-            value = cell.value
-
-            if not isinstance(
-                value,
-                str,
-            ):
-                continue
-
-            new_value = value
-
-            if pattern:
-                new_value = pattern.sub(
-                    new_month_str,
-                    new_value,
-                )
-
-            if alternate_pattern:
-                new_value = alternate_pattern.sub(
-                    alternate_new,
-                    new_value,
-                )
-
-            cell.value = new_value
 
 
 def update_active_workbook_month(
@@ -1091,12 +1534,6 @@ def update_active_workbook_month(
         Iterable[str]
     ] = None,
 ):
-    """
-    Replace month/year strings in active payroll sheets.
-
-    Historical log sheets such as AI - TDS should normally be skipped.
-    """
-
     skip = {
         str(name)
         for name in (
@@ -1105,30 +1542,20 @@ def update_active_workbook_month(
     }
 
     for ws in wb.worksheets:
-
         if ws.title in skip:
             continue
 
         for row in ws.iter_rows():
-
             for cell in row:
-
                 if not isinstance(
                     cell.value,
                     str,
                 ):
                     continue
 
-                original = cell.value
-
-                def replace_match(
-                    match,
-                ):
-                    return new_month_str
-
                 cell.value = MONTH_PATTERN.sub(
-                    replace_match,
-                    original,
+                    lambda match: new_month_str,
+                    cell.value,
                 )
 
 
@@ -1136,27 +1563,7 @@ def analyze_template_sheet(
     sheet,
 ) -> List[Dict[str, Any]]:
     """
-    Identify employee/consultant sections in one payroll sheet.
-
-    Returns sections with:
-
-        type
-        header_row
-        start_row
-        end_row
-        name_col
-        rows
-
-    Each row includes:
-
-        row_num
-        payroll_code
-        name
-        designation
-        branch
-        gross_salary
-        total_days
-        days_present
+    Identify employee and consultant sections in the payroll template.
     """
 
     rows = list(
@@ -1165,15 +1572,12 @@ def analyze_template_sheet(
         )
     )
 
-    section_headers: List[
-        tuple[int, str, int]
-    ] = []
+    section_headers = []
 
-    for r_idx, row in enumerate(
+    for row_index, row in enumerate(
         rows,
         start=1,
     ):
-
         normalized = [
             _normalize_header(value)
             for value in row
@@ -1182,55 +1586,49 @@ def analyze_template_sheet(
         employee_header = None
         consultant_header = None
 
-        for idx, value in enumerate(
+        for index, value in enumerate(
             normalized
         ):
-
             if value in {
                 "name of employee",
                 "employee name",
             }:
-                employee_header = idx
+                employee_header = index
 
             elif value in {
                 "name of consultant",
                 "name of freelancer",
             }:
-                consultant_header = idx
+                consultant_header = index
 
         if employee_header is not None:
             section_headers.append(
                 (
-                    r_idx,
+                    row_index,
                     "employee",
                     employee_header + 1,
                 )
             )
-
         elif consultant_header is not None:
             section_headers.append(
                 (
-                    r_idx,
+                    row_index,
                     "consultant",
                     consultant_header + 1,
                 )
             )
 
-    sections: List[
-        Dict[str, Any]
-    ] = []
+    sections = []
 
-    for idx, (
+    for index, (
         header_row,
         section_type,
         name_col,
-    ) in enumerate(
-        section_headers
-    ):
+    ) in enumerate(section_headers):
 
         next_header_row = (
-            section_headers[idx + 1][0]
-            if idx + 1 < len(section_headers)
+            section_headers[index + 1][0]
+            if index + 1 < len(section_headers)
             else len(rows) + 1
         )
 
@@ -1243,13 +1641,10 @@ def analyze_template_sheet(
             "rows": [],
         }
 
-        found_total = False
-
         for row_num in range(
             section["start_row"],
             section["end_row"] + 1,
         ):
-
             row = rows[
                 row_num - 1
             ]
@@ -1260,31 +1655,26 @@ def analyze_template_sheet(
                 if value is not None
             ]
 
-            is_total = (
-                any(
-                    value == "TOTAL"
-                    or value.startswith(
-                        "TOTAL "
-                    )
-                    for value in values_upper
-                )
-            )
-
-            if is_total:
-                section["end_row"] = (
-                    row_num - 1
-                )
-                found_total = True
+            if any(
+                value == "TOTAL"
+                or value.startswith("TOTAL ")
+                for value in values_upper
+            ):
+                section["end_row"] = row_num - 1
                 break
 
             if (
                 name_col > len(row)
-                or row[name_col - 1] is None
+                or row[
+                    name_col - 1
+                ] is None
             ):
                 continue
 
             name = str(
-                row[name_col - 1]
+                row[
+                    name_col - 1
+                ]
             ).strip()
 
             if not name:
@@ -1333,7 +1723,6 @@ def analyze_template_sheet(
                     if len(row) >= 7
                     else 0
                 )
-
             else:
                 total_days = (
                     row[3]
@@ -1366,15 +1755,6 @@ def analyze_template_sheet(
                 }
             )
 
-        if (
-            not found_total
-            and section["end_row"]
-            >= len(rows)
-        ):
-            section["end_row"] = len(
-                rows
-            )
-
         sections.append(
             section
         )
@@ -1387,19 +1767,10 @@ def _copy_row_with_translated_formulas(
     source_row: int,
     target_row: int,
 ):
-    """
-    Copy formatting, formulas, and values from source row to target row.
-
-    Relative references in formulas are translated to the target row.
-    """
-
-    max_column = sheet.max_column
-
     for col_idx in range(
         1,
-        max_column + 1,
+        sheet.max_column + 1,
     ):
-
         source = sheet.cell(
             source_row,
             col_idx,
@@ -1417,7 +1788,6 @@ def _copy_row_with_translated_formulas(
             )
             and source.value.startswith("=")
         ):
-
             try:
                 target.value = (
                     Translator(
@@ -1429,7 +1799,6 @@ def _copy_row_with_translated_formulas(
                 )
             except Exception:
                 target.value = source.value
-
         else:
             target.value = source.value
 
@@ -1488,12 +1857,6 @@ def add_new_hire_to_section(
     total_days: int,
     days_present: float,
 ) -> Optional[int]:
-    """
-    Insert a new hire into the first blank row in the section.
-
-    Returns the inserted row number, or None when no blank row exists.
-    """
-
     start_row = int(
         section["start_row"]
     )
@@ -1512,15 +1875,14 @@ def add_new_hire_to_section(
         start_row,
         end_row + 1,
     ):
-
-        name_value = sheet.cell(
+        value = sheet.cell(
             row_num,
             name_col,
         ).value
 
         if (
-            name_value is None
-            or not str(name_value).strip()
+            value is None
+            or not str(value).strip()
         ):
             empty_row = row_num
             break
@@ -1545,11 +1907,14 @@ def add_new_hire_to_section(
     ).value
 
     try:
-        sr_no = int(
-            float(
-                previous_sr
+        sr_no = (
+            int(
+                float(
+                    previous_sr
+                )
             )
-        ) + 1
+            + 1
+        )
     except (
         TypeError,
         ValueError,
@@ -1566,7 +1931,6 @@ def add_new_hire_to_section(
         name_col,
     ).value = hire["name"]
 
-    # Common designation / branch positions.
     sheet.cell(
         empty_row,
         3,
@@ -1584,7 +1948,6 @@ def add_new_hire_to_section(
     )
 
     if section["type"] == "employee":
-
         sheet.cell(
             empty_row,
             5,
@@ -1603,14 +1966,12 @@ def add_new_hire_to_section(
             0,
         )
 
-        # Clear Loan / Advance
         sheet.cell(
             empty_row,
             19,
         ).value = None
 
     else:
-
         sheet.cell(
             empty_row,
             4,
@@ -1629,7 +1990,6 @@ def add_new_hire_to_section(
             0,
         )
 
-        # Clear Loan / Advance
         sheet.cell(
             empty_row,
             15,
@@ -1638,166 +1998,34 @@ def add_new_hire_to_section(
     return empty_row
 
 
-def archive_previous_month_consultants(
-    wb,
-    old_month_year_str: str,
-):
-    """
-    Copy the consultant section from AI into AI - TDS.
+def get_days_in_month(
+    month_year_str: str,
+) -> int:
+    if not month_year_str:
+        return 30
 
-    This should be called only when moving from one payroll month
-    to another and only when archival is intentionally enabled.
-    """
-
-    if (
-        "AI" not in wb.sheetnames
-        or "AI - TDS" not in wb.sheetnames
-    ):
-        return
-
-    ai_sheet = wb["AI"]
-    tds_sheet = wb["AI - TDS"]
-
-    ai_sections = analyze_template_sheet(
-        ai_sheet
+    match = MONTH_PATTERN.search(
+        str(month_year_str)
     )
 
-    consultant_section = next(
-        (
-            section
-            for section in ai_sections
-            if section["type"] == "consultant"
-            and section.get("rows")
-        ),
-        None,
+    if not match:
+        return 30
+
+    month_name = (
+        match.group(1).lower()
     )
 
-    if consultant_section is None:
-        return
-
-    last_row = tds_sheet.max_row
-
-    while (
-        last_row > 1
-        and not any(
-            tds_sheet.cell(
-                last_row,
-                col_idx,
-            ).value
-            for col_idx in range(
-                1,
-                min(
-                    tds_sheet.max_column,
-                    20,
-                )
-                + 1,
-            )
-        )
-    ):
-        last_row -= 1
-
-    start_append_row = (
-        last_row + 3
+    year = int(
+        match.group(2)
     )
 
-    tds_sheet.cell(
-        start_append_row,
-        1,
-    ).value = (
-        "Consultant Fees for the Month of "
-        f"{old_month_year_str}"
+    month_number = list(
+        calendar.month_name
+    ).index(
+        month_name.capitalize()
     )
 
-    # Copy the top 4 header rows.
-    for offset in range(
-        1,
-        5,
-    ):
-        source_row = 1 + offset
-        target_row = (
-            start_append_row
-            + offset
-        )
-
-        for col_idx in range(
-            1,
-            min(
-                tds_sheet.max_column,
-                25,
-            )
-            + 1,
-        ):
-
-            source = tds_sheet.cell(
-                source_row,
-                col_idx,
-            )
-
-            target = tds_sheet.cell(
-                target_row,
-                col_idx,
-            )
-
-            target.value = source.value
-
-            if source.has_style:
-                target.font = copy(
-                    source.font
-                )
-                target.fill = copy(
-                    source.fill
-                )
-                target.border = copy(
-                    source.border
-                )
-                target.alignment = copy(
-                    source.alignment
-                )
-                target.number_format = (
-                    source.number_format
-                )
-
-    target_data_start = (
-        start_append_row + 5
-    )
-
-    source_rows = consultant_section[
-        "rows"
-    ]
-
-    for index, source_info in enumerate(
-        source_rows
-    ):
-        source_row = int(
-            source_info["row_num"]
-        )
-
-        target_row = (
-            target_data_start
-            + index
-        )
-
-        _copy_row_with_translated_formulas(
-            ai_sheet,
-            source_row,
-            target_row,
-        )
-
-    target_total_row = (
-        target_data_start
-        + len(source_rows)
-    )
-
-    source_total_row = (
-        consultant_section[
-            "end_row"
-        ]
-        + 1
-    )
-
-    if source_total_row <= ai_sheet.max_row:
-        _copy_row_with_translated_formulas(
-            ai_sheet,
-            source_total_row,
-            target_total_row,
-        )
+    return calendar.monthrange(
+        year,
+        month_number,
+    )[1]
