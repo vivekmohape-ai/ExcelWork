@@ -1915,19 +1915,45 @@ def get_days_in_month(
     if not match:
         return 30
 
-    month_name = (
-        match.group(1).lower()
-    )
+    month_name = match.group(1).lower()
 
     year = int(
         match.group(2)
     )
 
-    month_number = list(
-        calendar.month_name
-    ).index(
-        month_name.capitalize()
+    month_map = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "sept": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+
+    month_number = month_map.get(
+        month_name
     )
+
+    if month_number is None:
+        return 30
 
     return calendar.monthrange(
         year,
