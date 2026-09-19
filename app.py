@@ -50,6 +50,7 @@ st.caption(
 DEFAULTS = {
     "template_hash": None,
     "attendance_hash": None,
+    "daily_punch_hash": None,
     "leave_hash": None,
     "target_month": None,
     "attendance_records": [],
