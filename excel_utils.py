@@ -71,6 +71,11 @@ HEADER_SYNONYMS = {
         "a",
         "essl absent count",
     },
+    "payroll_paid_dates": {
+        "payroll paid dates",
+        "paid dates",
+        "policy paid dates",
+    },
     "payroll_unpaid_absent_days": {
         "payroll unpaid absent days",
         "unpaid absent days",
@@ -557,6 +562,11 @@ def parse_attendance_input(
             "payroll_unpaid_absent_dates"
         )
     )
+    payroll_paid_dates_col = (
+        header_columns.get(
+            "payroll_paid_dates"
+        )
+    )
 
     active_from_col = header_columns.get(
         "active_from"
@@ -753,6 +763,45 @@ def parse_attendance_input(
                 payroll_unpaid_absent_dates = (
                     str(value).strip()
                 )
+                        payroll_paid_dates = []
+
+        if (
+            payroll_paid_dates_col is not None
+            and payroll_paid_dates_col < len(row)
+        ):
+            value = row.iloc[
+                payroll_paid_dates_col
+            ]
+
+            if pd.notna(value):
+                raw_paid_dates = str(
+                    value
+                ).strip()
+
+                for item in re.split(
+                    r"[,;\n]+",
+                    raw_paid_dates,
+                ):
+                    item = item.strip()
+
+                    if not item:
+                        continue
+
+                    parsed_paid_date = pd.to_datetime(
+                        item,
+                        errors="coerce",
+                    )
+
+                    if pd.notna(
+                        parsed_paid_date
+                    ):
+                        payroll_paid_dates.append(
+                            pd.Timestamp(
+                                parsed_paid_date
+                            ).strftime(
+                                "%Y-%m-%d"
+                            )
+                        )
 
         active_from = None
         active_to = None
@@ -891,6 +940,7 @@ def parse_attendance_input(
                 "payroll_unpaid_absent_days": float(
                     payroll_unpaid_absent_days
                 ),
+                "payroll_paid_dates": payroll_paid_dates,
                 "absent_days": absent_days,
                 "payroll_unpaid_absent_dates": (
                     payroll_unpaid_absent_dates
