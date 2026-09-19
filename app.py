@@ -8,6 +8,7 @@ from excel_utils import (
     analyze_template_sheet,
     apply_leave_adjustments,
     get_days_in_month,
+    normalize_month_year,
     parse_daily_attendance_input,
     parse_leave_report,
 )
@@ -201,7 +202,7 @@ st.session_state.leave_records = leave_records
 if (
     attendance_month
     and leave_month
-    and attendance_month.lower() != leave_month.lower()
+    and normalize_month_year(attendance_month) != normalize_month_year(leave_month)
 ):
     st.error(
         "Attendance and Leave / Comp Off reports are for different months: "
