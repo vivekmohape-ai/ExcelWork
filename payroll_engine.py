@@ -16,6 +16,7 @@ from excel_utils import (
     analyze_template_sheet,
     detect_workbook_month,
     get_days_in_month,
+    normalize_month_year,
     parse_attendance_input,
     update_active_workbook_month,
 )
@@ -159,7 +160,7 @@ def detect_active_sheet_names(
 ) -> List[str]:
     active = []
 
-    normalized_template = normalize_name(
+    normalized_template = normalize_month_year(
         template_month or ""
     )
 
@@ -179,7 +180,7 @@ def detect_active_sheet_names(
         )
 
         normalized_months = {
-            normalize_name(month)
+            normalize_month_year(month)
             for month in months
         }
 
@@ -1190,9 +1191,8 @@ def archive_already_exists(
 
     ws = wb["AI - TDS"]
 
-    needle = normalize_name(
-        "Consultant Fees for the Month of "
-        f"{month_year}"
+    needle = normalize_month_year(
+        month_year
     )
 
     for row in ws.iter_rows(
@@ -1208,7 +1208,7 @@ def archive_already_exists(
                     cell.value,
                     str,
                 )
-                and normalize_name(
+                and normalize_month_year(
                     cell.value
                 ) == needle
             ):
@@ -1273,10 +1273,10 @@ def generate_payroll_workbook(
     if (
         archive_enabled
         and template_month
-        and normalize_name(
+        and normalize_month_year(
             template_month
         )
-        != normalize_name(
+        != normalize_month_year(
             target_month
         )
         and not archive_already_exists(
