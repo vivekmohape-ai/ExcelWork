@@ -26,47 +26,28 @@ MONTH_PATTERN = re.compile(
 def normalize_month_year(value: Any) -> str:
     """Normalize month/year labels for comparisons.
 
-    Examples:
-        August 2026 -> 2026-08
-        Aug 2026    -> 2026-08
+    Examples: August 2026, Aug 2026 and AUG 2026 all become 2026-08.
     """
     if value is None:
         return ""
-
     text = str(value).strip()
     if not text:
         return ""
-
     match = MONTH_PATTERN.search(text)
     if match:
         aliases = {
-            "jan": "january",
-            "feb": "february",
-            "mar": "march",
-            "apr": "april",
-            "may": "may",
-            "jun": "june",
-            "jul": "july",
-            "aug": "august",
-            "sep": "september",
-            "sept": "september",
-            "oct": "october",
-            "nov": "november",
+            "jan": "january", "feb": "february", "mar": "march",
+            "apr": "april", "may": "may", "jun": "june",
+            "jul": "july", "aug": "august", "sep": "september",
+            "sept": "september", "oct": "october", "nov": "november",
             "dec": "december",
         }
-        month_name = aliases.get(
-            match.group(1).lower(),
-            match.group(1).lower(),
-        )
-        month_number = list(calendar.month_name).index(
-            month_name.capitalize()
-        )
+        month_name = aliases.get(match.group(1).lower(), match.group(1).lower())
+        month_number = list(calendar.month_name).index(month_name.capitalize())
         return f"{int(match.group(2)):04d}-{month_number:02d}"
-
     parsed = pd.to_datetime(text, errors="coerce")
     if pd.notna(parsed):
         return pd.Timestamp(parsed).strftime("%Y-%m")
-
     return text.lower()
 
 
@@ -117,6 +98,11 @@ HEADER_SYNONYMS = {
         "absent",
         "a",
         "essl absent count",
+    },
+    "payroll_paid_dates": {
+        "payroll paid dates",
+        "paid dates",
+        "policy paid dates",
     },
     "payroll_unpaid_absent_days": {
         "payroll unpaid absent days",
@@ -604,6 +590,11 @@ def parse_attendance_input(
             "payroll_unpaid_absent_dates"
         )
     )
+    payroll_paid_dates_col = (
+        header_columns.get(
+            "payroll_paid_dates"
+        )
+    )
 
     active_from_col = header_columns.get(
         "active_from"
@@ -800,6 +791,45 @@ def parse_attendance_input(
                 payroll_unpaid_absent_dates = (
                     str(value).strip()
                 )
+        payroll_paid_dates = []
+
+        if (
+            payroll_paid_dates_col is not None
+            and payroll_paid_dates_col < len(row)
+        ):
+            value = row.iloc[
+                payroll_paid_dates_col
+            ]
+
+            if pd.notna(value):
+                raw_paid_dates = str(
+                    value
+                ).strip()
+
+                for item in re.split(
+                    r"[,;\n]+",
+                    raw_paid_dates,
+                ):
+                    item = item.strip()
+
+                    if not item:
+                        continue
+
+                    parsed_paid_date = pd.to_datetime(
+                        item,
+                        errors="coerce",
+                    )
+
+                    if pd.notna(
+                        parsed_paid_date
+                    ):
+                        payroll_paid_dates.append(
+                            pd.Timestamp(
+                                parsed_paid_date
+                            ).strftime(
+                                "%Y-%m-%d"
+                            )
+                        )
 
         active_from = None
         active_to = None
@@ -938,6 +968,7 @@ def parse_attendance_input(
                 "payroll_unpaid_absent_days": float(
                     payroll_unpaid_absent_days
                 ),
+                "payroll_paid_dates": payroll_paid_dates,
                 "absent_days": absent_days,
                 "payroll_unpaid_absent_dates": (
                     payroll_unpaid_absent_dates
@@ -955,7 +986,899 @@ def parse_attendance_input(
         )
 
     return month_year, records
+def parse_daily_punch_report(
+    file_content: Any,
+    filename: Optional[str] = None,
+):
+    """
+    Parse ESSL Daily Attendance Report / Summary Report.
 
+    The report contains repeated employee blocks such as:
+
+        Employee Code: 12
+        Employee Name: Prince Chande
+
+        Date        InTime   OutTime   Status
+        05-Aug-2026 11:21             Absent
+
+    Business rule:
+        If either InTime OR OutTime exists for an employee/date,
+        that date is considered PRESENT.
+
+    Returns:
+        month_year,
+        {
+            employee_id: {
+                "name": employee_name,
+                "punch_dates": set(...),
+                "punch_details": {
+                    date: {
+                        "in_time": ...,
+                        "out_time": ...,
+                    }
+                },
+            }
+        }
+    """
+
+    if hasattr(file_content, "seek"):
+        file_content.seek(0)
+
+    if isinstance(
+        file_content,
+        (bytes, bytearray),
+    ):
+        file_content = io.BytesIO(
+            file_content
+        )
+
+    try:
+        xls = pd.ExcelFile(
+            file_content
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Could not read the Daily Attendance Report. "
+            "For .xls files, make sure xlrd>=2.0.1 is installed."
+        ) from exc
+
+    employees: Dict[str, Dict[str, Any]] = {}
+    detected_dates: List[pd.Timestamp] = []
+
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(
+            xls,
+            sheet_name=sheet_name,
+            header=None,
+        )
+
+        if df.empty:
+            continue
+
+        current_employee_id = ""
+        current_employee_name = ""
+
+        # ESSL Daily Attendance Report column positions can contain
+        # leading blank columns. Detect the repeated table header instead
+        # of assuming Date is column 0.
+        date_col = 1
+        in_time_col = 3
+        out_time_col = 4
+        status_col = 7
+
+        for row_idx in range(
+            len(df)
+        ):
+            row = df.iloc[row_idx]
+
+            values = [
+                value
+                for value in row.tolist()
+                if pd.notna(value)
+                and str(value).strip()
+            ]
+
+            if not values:
+                continue
+
+            normalized_values = [
+                _normalize_header(value)
+                for value in values
+            ]
+
+            # --------------------------------------------------------
+            # Detect repeated Daily Attendance table header
+            # --------------------------------------------------------
+
+            header_positions = {
+                value: index
+                for index, value in enumerate(
+                    normalized_values
+                )
+            }
+
+            if (
+                "date" in header_positions
+                and "intime" in header_positions
+                and "outtime" in header_positions
+                and "status" in header_positions
+            ):
+                # normalized_values is built from non-empty cells, so
+                # these indices are not necessarily the original DataFrame
+                # column positions. Resolve them against the raw row.
+                for raw_index, raw_value in enumerate(
+                    row.tolist()
+                ):
+                    normalized = _normalize_header(raw_value)
+
+                    if normalized == "date":
+                        date_col = raw_index
+                    elif normalized == "intime":
+                        in_time_col = raw_index
+                    elif normalized == "outtime":
+                        out_time_col = raw_index
+                    elif normalized == "status":
+                        status_col = raw_index
+
+                continue
+
+            # --------------------------------------------------------
+            # Detect employee header row
+            # --------------------------------------------------------
+
+            employee_code_index = None
+            employee_name_index = None
+
+            for index, value in enumerate(
+                normalized_values
+            ):
+                if value == "employee code":
+                    employee_code_index = index
+
+                elif value == "employee name":
+                    employee_name_index = index
+
+            if employee_code_index is not None:
+                code_value = None
+
+                if (
+                    employee_code_index + 1
+                    < len(values)
+                ):
+                    code_value = values[
+                        employee_code_index + 1
+                    ]
+
+                employee_id = (
+                    _normalize_employee_id_local(
+                        code_value
+                    )
+                )
+
+                name_value = None
+
+                if employee_name_index is not None:
+                    if (
+                        employee_name_index + 1
+                        < len(values)
+                    ):
+                        name_value = values[
+                            employee_name_index + 1
+                        ]
+
+                employee_name = (
+                    str(name_value).strip()
+                    if name_value is not None
+                    else ""
+                )
+
+                if employee_id:
+                    current_employee_id = (
+                        employee_id
+                    )
+
+                    current_employee_name = (
+                        employee_name
+                    )
+
+                    employees.setdefault(
+                        employee_id,
+                        {
+                            "name": employee_name,
+                            "punch_dates": set(),
+                            "punch_details": {},
+                            "attendance_statuses": {},
+                        },
+                    )
+
+                    if employee_name:
+                        employees[
+                            employee_id
+                        ]["name"] = employee_name
+
+                continue
+
+            # --------------------------------------------------------
+            # Ignore rows before an employee block
+            # --------------------------------------------------------
+
+            if not current_employee_id:
+                continue
+
+            # --------------------------------------------------------
+            # Read the date / punch columns discovered from the ESSL
+            # repeated table header.
+            # --------------------------------------------------------
+
+            if (
+                date_col >= len(row)
+                or in_time_col >= len(row)
+                or out_time_col >= len(row)
+            ):
+                continue
+
+            raw_date = row.iloc[date_col]
+
+            parsed_date = pd.to_datetime(
+                raw_date,
+                errors="coerce",
+            )
+
+            if pd.isna(parsed_date):
+                continue
+
+            parsed_date = pd.Timestamp(
+                parsed_date
+            ).normalize()
+
+            in_time = row.iloc[in_time_col]
+            out_time = row.iloc[out_time_col]
+
+            raw_status = (
+                row.iloc[status_col]
+                if status_col < len(row)
+                else ""
+            )
+            status_text = (
+                str(raw_status).strip()
+                if pd.notna(raw_status)
+                else ""
+            )
+
+            date_key = parsed_date.strftime(
+                "%Y-%m-%d"
+            )
+
+            employees[
+                current_employee_id
+            ]["attendance_statuses"][
+                date_key
+            ] = status_text
+
+            has_in_time = (
+                pd.notna(in_time)
+                and str(in_time).strip() != ""
+            )
+
+            has_out_time = (
+                pd.notna(out_time)
+                and str(out_time).strip() != ""
+            )
+
+            # --------------------------------------------------------
+            # Critical rule:
+            #
+            # InTime OR OutTime = PRESENT
+            # --------------------------------------------------------
+
+            if not (
+                has_in_time
+                or has_out_time
+            ):
+                continue
+
+            employees[
+                current_employee_id
+            ]["punch_dates"].add(
+                date_key
+            )
+
+            employees[
+                current_employee_id
+            ]["punch_details"][
+                date_key
+            ] = {
+                "in_time": (
+                    str(in_time).strip()
+                    if has_in_time
+                    else ""
+                ),
+                "out_time": (
+                    str(out_time).strip()
+                    if has_out_time
+                    else ""
+                ),
+                "source_sheet": sheet_name,
+            }
+
+            detected_dates.append(
+                parsed_date
+            )
+
+    if not employees:
+        raise ValueError(
+            "No employee punch records were found "
+            "in the Daily Attendance Report."
+        )
+
+    month_year = None
+
+    if detected_dates:
+        first_date = min(
+            detected_dates
+        )
+
+        month_year = (
+            f"{first_date.strftime('%B')} "
+            f"{first_date.year}"
+        )
+
+    return (
+        month_year,
+        employees,
+    )
+
+
+def apply_daily_punch_corrections(
+    attendance_records: List[Dict[str, Any]],
+    punch_records: Dict[str, Dict[str, Any]],
+):
+    """
+    Correct ESSL attendance using the Daily Attendance Report.
+
+    Only positive corrections are made.
+
+    If Basic ESSL says:
+        A / blank / half-day
+
+    but the Daily Attendance Report contains:
+        InTime OR OutTime
+
+    then that date becomes PRESENT.
+
+    Existing PRESENT dates are never counted twice.
+
+    Dates already included in the ESSL Payroll Present Days
+    through the extractor's payroll-paid-date policy are also
+    not counted twice.
+
+    Returns a summary dictionary.
+    """
+
+    corrected_employees = 0
+    corrected_days = 0
+    already_counted = 0
+    unmatched_punch_ids = 0
+    correction_details = []
+
+    for record in attendance_records:
+        employee_id = _normalize_employee_id_local(
+            record.get("employee_id")
+        )
+
+        if not employee_id:
+            continue
+
+        punch_record = punch_records.get(
+            employee_id
+        )
+
+        if punch_record is None:
+            unmatched_punch_ids += 1
+            record[
+                "punch_correction_count"
+            ] = 0
+            record[
+                "punch_correction_dates"
+            ] = []
+            continue
+
+        existing_present_dates = set(
+            record.get(
+                "present_dates",
+                [],
+            )
+            or []
+        )
+
+        existing_half_dates = set(
+            record.get(
+                "half_present_dates",
+                [],
+            )
+            or []
+        )
+
+        # These dates are already included in the payroll
+        # attendance calculation by the ESSL Extractor.
+        payroll_paid_dates = set(
+            record.get(
+                "payroll_paid_dates",
+                [],
+            )
+            or []
+        )
+
+        employee_corrections = []
+
+        for date_key in sorted(
+            punch_record.get(
+                "punch_dates",
+                set(),
+            )
+        ):
+
+            # Already a full PRESENT date.
+            if date_key in existing_present_dates:
+                already_counted += 1
+                continue
+
+            # Already included through the payroll calendar
+            # policy, so adding it again would double count.
+            if date_key in payroll_paid_dates:
+                already_counted += 1
+                continue
+
+            # Convert half-day to full present.
+            if date_key in existing_half_dates:
+                delta = 0.5
+                existing_half_dates.remove(
+                    date_key
+                )
+            else:
+                delta = 1.0
+
+            existing_present_dates.add(
+                date_key
+            )
+
+            detail = (
+                punch_record.get(
+                    "punch_details",
+                    {},
+                ).get(
+                    date_key,
+                    {},
+                )
+            )
+
+            employee_corrections.append(
+                {
+                    "date": date_key,
+                    "in_time": detail.get(
+                        "in_time",
+                        "",
+                    ),
+                    "out_time": detail.get(
+                        "out_time",
+                        "",
+                    ),
+                    "reason": (
+                        "InTime or OutTime exists"
+                    ),
+                }
+            )
+
+            record[
+                "essl_present_days"
+            ] = float(
+                record.get(
+                    "essl_present_days",
+                    0,
+                )
+                or 0
+            ) + delta
+
+            record[
+                "payroll_present_days"
+            ] = float(
+                record.get(
+                    "payroll_present_days",
+                    record.get(
+                        "days_present",
+                        0,
+                    ),
+                )
+                or 0
+            ) + delta
+
+            record[
+                "days_present"
+            ] = record[
+                "payroll_present_days"
+            ]
+
+            corrected_days += delta
+
+        record[
+            "present_dates"
+        ] = sorted(
+            existing_present_dates
+        )
+
+        record[
+            "half_present_dates"
+        ] = sorted(
+            existing_half_dates
+        )
+
+        record[
+            "punch_correction_count"
+        ] = len(
+            employee_corrections
+        )
+
+        record[
+            "punch_correction_dates"
+        ] = [
+            item["date"]
+            for item in employee_corrections
+        ]
+
+        record[
+            "punch_correction_details"
+        ] = employee_corrections
+
+        if employee_corrections:
+            corrected_employees += 1
+
+            correction_details.append(
+                {
+                    "employee_id": employee_id,
+                    "name": record.get(
+                        "name",
+                        "",
+                    ),
+                    "corrections": employee_corrections,
+                }
+            )
+
+    return {
+        "employees_corrected": corrected_employees,
+        "days_corrected": corrected_days,
+        "already_present_or_paid": already_counted,
+        "unmatched_employee_ids": unmatched_punch_ids,
+        "details": correction_details,
+    }
+
+
+def _policy_paid_dates_for_period(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> List[str]:
+    """
+    Return payroll policy dates for the active period.
+
+    Policy:
+        * Every Sunday is paid.
+        * 2nd Saturday is paid.
+        * 4th Saturday is paid.
+        * Public holidays are paid.
+        * A date is returned only once.
+
+    The 2026 holiday list is the holiday calendar supplied for this
+    payroll workflow. Future years can be extended here without changing
+    the Daily Attendance parser.
+    """
+    public_holidays = {
+        "2026-01-01",
+        "2026-01-26",
+        "2026-03-04",
+        "2026-03-19",
+        "2026-05-01",
+        "2026-08-15",
+        "2026-08-28",
+        "2026-09-14",
+        "2026-10-02",
+        "2026-10-20",
+        "2026-11-11",
+        "2026-12-25",
+    }
+
+    paid_dates = set()
+
+    current = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    while current <= end:
+        weekday = current.weekday()  # Monday=0, Sunday=6
+
+        if weekday == 6:
+            paid_dates.add(current.strftime("%Y-%m-%d"))
+
+        elif weekday == 5:
+            # Saturday occurrence within its calendar month.
+            occurrence = ((current.day - 1) // 7) + 1
+
+            if occurrence in {2, 4}:
+                paid_dates.add(current.strftime("%Y-%m-%d"))
+
+        date_key = current.strftime("%Y-%m-%d")
+
+        if date_key in public_holidays:
+            paid_dates.add(date_key)
+
+        current += pd.Timedelta(days=1)
+
+    return sorted(paid_dates)
+
+
+def parse_daily_attendance_input(
+    file_content: Any,
+    filename: Optional[str] = None,
+):
+    """
+    Build payroll attendance directly from the ESSL Daily Attendance Report.
+
+    This is the primary attendance input for Payroll Automator.
+
+    Business rule:
+        If either InTime OR OutTime exists for an employee/date,
+        the date is Present.
+
+    Payroll calendar policy:
+        * Every Sunday is paid.
+        * 2nd Saturday is paid.
+        * 4th Saturday is paid.
+        * Public holidays are paid.
+        * Policy dates are counted only once even if a punch exists.
+
+    The Daily Attendance Report does not contain a reliable joining-date
+    field in the supplied ESSL format. For payroll-calendar purposes,
+    the first date on which the employee has an InTime or OutTime is
+    treated as the active-from date. Active-to is the last day of the
+    report month.
+
+    Returns:
+        month_year, attendance_records
+    """
+    month_year, punch_records = parse_daily_punch_report(
+        file_content,
+        filename=filename,
+    )
+
+    if not month_year:
+        raise ValueError(
+            "Could not determine the month from the Daily Attendance Report."
+        )
+
+    month_match = MONTH_PATTERN.search(str(month_year))
+    if not month_match:
+        raise ValueError(
+            f"Could not determine month/year from Daily Attendance Report: {month_year}"
+        )
+
+    month_aliases = {
+        "jan": "january",
+        "feb": "february",
+        "mar": "march",
+        "apr": "april",
+        "may": "may",
+        "jun": "june",
+        "jul": "july",
+        "aug": "august",
+        "sep": "september",
+        "sept": "september",
+        "oct": "october",
+        "nov": "november",
+        "dec": "december",
+    }
+
+    month_name = month_aliases.get(
+        month_match.group(1).lower(),
+        month_match.group(1).lower(),
+    )
+
+    month_number = list(calendar.month_name).index(
+        month_name.capitalize()
+    )
+    year_number = int(month_match.group(2))
+
+    month_start = pd.Timestamp(
+        date(year_number, month_number, 1)
+    )
+    month_end = pd.Timestamp(
+        date(
+            year_number,
+            month_number,
+            calendar.monthrange(
+                year_number,
+                month_number,
+            )[1],
+        )
+    )
+
+    records: List[Dict[str, Any]] = []
+
+    for employee_id, employee in punch_records.items():
+        name = str(employee.get("name") or "").strip()
+
+        if not _valid_attendance_row(
+            _normalize_employee_id_local(employee_id),
+            name,
+        ):
+            continue
+
+        punch_dates = {
+            str(value)
+            for value in employee.get(
+                "punch_dates",
+                set(),
+            )
+        }
+
+        punch_dates = {
+            value
+            for value in punch_dates
+            if (
+                pd.notna(
+                    pd.to_datetime(
+                        value,
+                        errors="coerce",
+                    )
+                )
+                and month_start
+                <= pd.Timestamp(value)
+                <= month_end
+            )
+        }
+
+        attendance_statuses = {
+            str(key): str(value or "").strip().lower()
+            for key, value in employee.get(
+                "attendance_statuses",
+                {},
+            ).items()
+        }
+
+        # ESSL supplies a daily status for every calendar date. Treat the
+        # first date that is not a WeeklyOff as the active-from date. This
+        # preserves dates such as an employee's first-day Absent record,
+        # while still avoiding policy credits before the first actual
+        # activity when the report only contains WeeklyOff rows.
+        active_candidates = [
+            pd.Timestamp(key)
+            for key, status in attendance_statuses.items()
+            if status
+            and status not in {
+                "weeklyoff",
+                "weekly off",
+                "wo",
+            }
+        ]
+
+        if active_candidates:
+            active_from_date = min(
+                active_candidates
+            ).normalize()
+        elif punch_dates:
+            active_from_date = min(
+                pd.Timestamp(value)
+                for value in punch_dates
+            ).normalize()
+        else:
+            active_from_date = None
+
+        present_dates = sorted(punch_dates)
+
+        policy_paid_dates = []
+        if active_from_date is not None:
+            policy_paid_dates = _policy_paid_dates_for_period(
+                active_from_date,
+                month_end,
+            )
+
+        payroll_paid_date_set = (
+            set(present_dates)
+            | set(policy_paid_dates)
+        )
+
+        payroll_paid_dates = sorted(
+            payroll_paid_date_set
+        )
+
+        active_start = (
+            active_from_date
+            if active_from_date is not None
+            else None
+        )
+
+        if active_start is None:
+            payroll_unpaid_absent_dates = []
+            absent_dates = []
+        else:
+            all_active_dates = pd.date_range(
+                active_start,
+                month_end,
+                freq="D",
+            )
+
+            present_set = set(
+                present_dates
+            )
+            policy_set = set(
+                policy_paid_dates
+            )
+
+            payroll_unpaid_absent_dates = [
+                current.strftime("%Y-%m-%d")
+                for current in all_active_dates
+                if (
+                    current.strftime("%Y-%m-%d")
+                    not in present_set
+                    and current.strftime("%Y-%m-%d")
+                    not in policy_set
+                    and current.weekday() < 5
+                )
+            ]
+
+            absent_dates = [
+                current.strftime("%Y-%m-%d")
+                for current in all_active_dates
+                if current.strftime("%Y-%m-%d")
+                not in present_set
+            ]
+
+        records.append(
+            {
+                "employee_id": _normalize_employee_id_local(
+                    employee_id
+                ),
+                "name": name,
+                "days_present": float(
+                    len(payroll_paid_dates)
+                ),
+                "essl_present_days": float(
+                    len(present_dates)
+                ),
+                "payroll_present_days": float(
+                    len(payroll_paid_dates)
+                ),
+                "absent_count": float(
+                    len(absent_dates)
+                ),
+                "payroll_unpaid_absent_days": float(
+                    len(payroll_unpaid_absent_dates)
+                ),
+                "payroll_paid_dates": payroll_paid_dates,
+                "absent_days": ", ".join(
+                    absent_dates
+                ),
+                "payroll_unpaid_absent_dates": ", ".join(
+                    payroll_unpaid_absent_dates
+                ),
+                "active_from": (
+                    int(active_from_date.day)
+                    if active_from_date is not None
+                    else None
+                ),
+                "active_to": (
+                    int(month_end.day)
+                    if active_from_date is not None
+                    else None
+                ),
+                "present_dates": present_dates,
+                "half_present_dates": [],
+            }
+        )
+
+    if not records:
+        raise ValueError(
+            "No valid employee attendance records were found "
+            "in the Daily Attendance Report."
+        )
+
+    return month_year, records
 
 def _leave_name_normalized(
     value: Any,
@@ -1305,252 +2228,156 @@ def apply_leave_adjustments(
     mappings: Dict[str, Dict[str, Any]],
     leave_records: List[Dict[str, Any]],
     total_days: int,
+    opening_balances: Optional[Dict[str, float]] = None,
+    monthly_accrual: float = 2.0,
 ) -> Dict[str, int]:
+    """Apply the Leave / Comp Off second layer to ESSL payroll days.
+
+    ESSL payroll_present_days is already the corrected attendance value and
+    already includes paid Sundays, qualifying Saturdays, and public holidays.
+    This function therefore adds only paid leave and approved comp off.
+
+    Leave balance:
+        opening balance + monthly accrual = available balance
+        paid leave = min(approved leave, available balance)
+        unpaid leave = approved leave - paid leave
+        closing balance = available balance - paid leave
+
+    The Leave report contains aggregate counts rather than leave dates, so
+    overlap with dates already paid by the ESSL calendar policy cannot be
+    resolved from this report alone.
     """
-    Reconcile approved paid leave / comp off into payroll payable days.
-
-    Current Leave report is aggregate only, so individual leave dates
-    are not available for exact date overlap checking.
-
-    Calculation:
-
-        final_payable_days =
-            payroll_present_days
-            + approved_leaves
-            + approved_comp_offs
-
-    The result is capped at total calendar days in the month.
-
-    Unpaid leave is not added.
-
-    All source values are preserved in the mapping for audit.
-    """
-
+    opening_balances = opening_balances or {}
     matched = 0
     unmatched = 0
     adjusted = 0
 
     for mapping in mappings.values():
-        attendance_name = str(
-            mapping.get(
-                "attendance_name"
-            )
-            or ""
-        ).strip()
+        attendance_name = str(mapping.get("attendance_name") or "").strip()
+        payroll_name = str(mapping.get("payroll_name") or "").strip()
+        target_name = attendance_name or payroll_name
 
-        payroll_name = str(
-            mapping.get(
-                "payroll_name"
-            )
-            or ""
-        ).strip()
-
-        target_name = (
-            attendance_name
-            or payroll_name
-        )
-
-        (
-            leave_record,
-            match_method,
-            score,
-        ) = match_leave_record(
-            target_name,
-            leave_records,
+        leave_record, match_method, score = match_leave_record(
+            target_name, leave_records
         )
 
         base_payroll_days = float(
-            mapping.get(
-                "payroll_present_days"
-            )
-            if mapping.get(
-                "payroll_present_days"
-            ) is not None
-            else mapping.get(
-                "days_present"
-            )
-            or 0
+            mapping.get("payroll_present_days")
+            if mapping.get("payroll_present_days") is not None
+            else mapping.get("days_present") or 0
         )
+        mapping["payroll_present_days"] = base_payroll_days
 
-        mapping[
-            "payroll_present_days"
-        ] = base_payroll_days
-
-        mapping[
-            "approved_leaves"
-        ] = 0.0
-
-        mapping[
-            "approved_comp_offs"
-        ] = 0.0
-
-        mapping[
-            "unpaid_leaves"
-        ] = 0.0
-
-        mapping[
-            "leave_adjustment"
-        ] = 0.0
-
-        mapping[
-            "final_payable_days"
-        ] = base_payroll_days
-
-        mapping[
-            "leave_match_method"
-        ] = match_method
-
-        mapping[
-            "leave_match_score"
-        ] = score
-
-        mapping[
-            "leave_report_name"
-        ] = ""
-
-        mapping[
-            "leave_note"
-        ] = ""
+        # Reset all reconciliation fields on every run.
+        for key in (
+            "approved_leaves", "approved_comp_offs", "reported_unpaid_leaves",
+            "balance_based_unpaid_leaves", "unpaid_leaves",
+            "opening_leave_balance", "available_leave_balance",
+            "paid_leave_used", "closing_leave_balance",
+            "leave_adjustment", "comp_off_adjustment",
+        ):
+            mapping[key] = 0.0
+        mapping["monthly_leave_accrual"] = float(monthly_accrual)
+        mapping["final_payable_days"] = base_payroll_days
+        mapping["leave_match_method"] = match_method
+        mapping["leave_match_score"] = score
+        mapping["leave_report_name"] = ""
+        mapping["leave_note"] = ""
 
         if leave_record is None:
             unmatched += 1
-
             if match_method == "REVIEW":
-                mapping[
-                    "leave_note"
-                ] = (
-                    "Possible Leave report name match found, "
-                    "but it was not applied automatically."
+                mapping["leave_note"] = (
+                    "Possible Leave report name match found, but it was not "
+                    "applied automatically."
                 )
             elif match_method == "AMBIGUOUS EXACT NAME":
-                mapping[
-                    "leave_note"
-                ] = (
-                    "Multiple Leave report rows match this name."
+                mapping["leave_note"] = (
+                    "Multiple Leave report rows match this employee."
                 )
             else:
-                mapping[
-                    "leave_note"
-                ] = (
-                    "No matching Leave / Comp Off record found."
+                mapping["leave_note"] = (
+                    "No matching Leave / Comp Off record found. No leave "
+                    "adjustment applied."
                 )
-
-            mapping[
-                "days_present"
-            ] = base_payroll_days
-
+            mapping["days_present"] = base_payroll_days
             continue
 
         matched += 1
+        approved_leaves = float(leave_record.get("approved_leaves") or 0)
+        approved_comp_offs = float(leave_record.get("approved_comp_offs") or 0)
+        reported_unpaid = float(leave_record.get("unpaid_leaves") or 0)
 
-        approved_leaves = float(
-            leave_record.get(
-                "approved_leaves"
+        essl_id = _normalize_employee_id_local(mapping.get("essl_id"))
+        opening_balance = float(opening_balances.get(essl_id, 0.0))
+        available_balance = opening_balance + float(monthly_accrual)
+
+        paid_leave_used = min(approved_leaves, available_balance)
+        balance_based_unpaid = max(0.0, approved_leaves - paid_leave_used)
+        total_unpaid = max(reported_unpaid, balance_based_unpaid)
+        closing_balance = max(0.0, available_balance - paid_leave_used)
+
+        remaining_capacity = max(
+            0.0, float(total_days) - base_payroll_days
+        )
+        applied_leave = min(paid_leave_used, remaining_capacity)
+        remaining_capacity -= applied_leave
+        applied_comp_off = min(approved_comp_offs, remaining_capacity)
+
+        final_payable_days = min(
+            base_payroll_days + applied_leave + applied_comp_off,
+            float(total_days),
+        )
+
+        mapping.update({
+            "approved_leaves": approved_leaves,
+            "approved_comp_offs": approved_comp_offs,
+            "reported_unpaid_leaves": reported_unpaid,
+            "balance_based_unpaid_leaves": balance_based_unpaid,
+            "unpaid_leaves": total_unpaid,
+            "opening_leave_balance": opening_balance,
+            "available_leave_balance": available_balance,
+            "paid_leave_used": paid_leave_used,
+            "closing_leave_balance": closing_balance,
+            "leave_adjustment": applied_leave,
+            "comp_off_adjustment": applied_comp_off,
+            "final_payable_days": final_payable_days,
+            "leave_report_name": str(leave_record.get("name") or ""),
+            "days_present": final_payable_days,
+        })
+
+        mapping["leave_note"] = (
+            "Leave balance reconciliation applied. "
+            f"Opening balance={opening_balance:g}, "
+            f"monthly accrual={monthly_accrual:g}, "
+            f"available={available_balance:g}, "
+            f"approved={approved_leaves:g}, "
+            f"paid={paid_leave_used:g}, "
+            f"unpaid={total_unpaid:g}, "
+            f"closing balance={closing_balance:g}."
+        )
+        if reported_unpaid != balance_based_unpaid:
+            mapping["leave_note"] += (
+                " Reported unpaid leave differs from the balance-based calculation."
             )
-            or 0
-        )
-
-        approved_comp_offs = float(
-            leave_record.get(
-                "approved_comp_offs"
+        if applied_leave < paid_leave_used:
+            mapping["leave_note"] += (
+                " Paid leave was capped by remaining calendar-day capacity."
             )
-            or 0
-        )
-
-        unpaid_leaves = float(
-            leave_record.get(
-                "unpaid_leaves"
-            )
-            or 0
-        )
-
-        requested_adjustment = (
-            approved_leaves
-            + approved_comp_offs
-        )
-
-        maximum_allowed = max(
-            0.0,
-            float(total_days)
-            - base_payroll_days,
-        )
-
-        applied_adjustment = min(
-            requested_adjustment,
-            maximum_allowed,
-        )
-
-        final_payable_days = (
-            base_payroll_days
-            + applied_adjustment
-        )
-
-        mapping[
-            "approved_leaves"
-        ] = approved_leaves
-
-        mapping[
-            "approved_comp_offs"
-        ] = approved_comp_offs
-
-        mapping[
-            "unpaid_leaves"
-        ] = unpaid_leaves
-
-        mapping[
-            "leave_adjustment"
-        ] = applied_adjustment
-
-        mapping[
-            "final_payable_days"
-        ] = final_payable_days
-
-        mapping[
-            "leave_report_name"
-        ] = str(
-            leave_record.get(
-                "name"
-            )
-            or ""
-        )
-
-        mapping[
-            "leave_note"
-        ] = (
-            "Aggregate leave reconciliation applied. "
-            "The Leave report contains counts only, not leave dates, "
-            "so exact overlap with an already paid calendar date "
-            "cannot be determined."
-        )
-
-        if (
-            requested_adjustment
-            > applied_adjustment
-        ):
-            mapping[
-                "leave_note"
-            ] += (
-                f" Requested adjustment "
-                f"{requested_adjustment:g} day(s) was capped so "
-                f"payable days do not exceed {total_days}."
+        if applied_comp_off < approved_comp_offs:
+            mapping["leave_note"] += (
+                " Comp Off was capped by remaining calendar-day capacity."
             )
 
-        mapping[
-            "days_present"
-        ] = final_payable_days
-
-        if applied_adjustment > 0:
+        if applied_leave > 0 or applied_comp_off > 0:
             adjusted += 1
 
     return {
         "matched": matched,
         "unmatched": unmatched,
         "adjusted": adjusted,
-        "total_leave_records": len(
-            leave_records
-        ),
+        "total_leave_records": len(leave_records),
     }
-
 
 def detect_workbook_month(
     wb,
@@ -2048,17 +2875,6 @@ def add_new_hire_to_section(
 def get_days_in_month(
     month_year_str: str,
 ) -> int:
-    """
-    Return the number of calendar days for a month/year string.
-
-    Supports both full month names and abbreviations:
-
-        August 2026
-        Aug 2026
-        September 2026
-        Sep 2026
-    """
-
     if not month_year_str:
         return 30
 
@@ -2067,46 +2883,47 @@ def get_days_in_month(
     )
 
     if not match:
-        raise ValueError(
-            f"Invalid month/year format: {month_year_str}"
-        )
+        return 30
 
-    month_text = (
-        match.group(1)
-        .strip()
-        .lower()
-    )
+    month_name = match.group(1).lower()
 
     year = int(
         match.group(2)
     )
 
-    month_aliases = {
-        "jan": "january",
-        "feb": "february",
-        "mar": "march",
-        "apr": "april",
-        "may": "may",
-        "jun": "june",
-        "jul": "july",
-        "aug": "august",
-        "sep": "september",
-        "sept": "september",
-        "oct": "october",
-        "nov": "november",
-        "dec": "december",
+    month_map = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "sept": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
     }
 
-    month_name = month_aliases.get(
-        month_text,
-        month_text,
+    month_number = month_map.get(
+        month_name
     )
 
-    month_number = list(
-        calendar.month_name
-    ).index(
-        month_name.capitalize()
-    )
+    if month_number is None:
+        return 30
 
     return calendar.monthrange(
         year,
