@@ -6,9 +6,11 @@ import pandas as pd
 
 from excel_utils import (
     analyze_template_sheet,
+    apply_daily_punch_corrections,
     apply_leave_adjustments,
     get_days_in_month,
     parse_attendance_input,
+    parse_daily_punch_report,
     parse_leave_report,
 )
 from identity import (
