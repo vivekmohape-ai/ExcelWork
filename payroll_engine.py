@@ -532,9 +532,7 @@ def update_attendance_rows(
                         )
                         or 0
                     )
-                    if mapping.get(
-                        "confirmed"
-                    )
+                    if mapping.get("confirmed") or mapping.get("essl_id")
                     else 0.0
                 )
 
