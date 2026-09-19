@@ -72,6 +72,7 @@ for key, value in DEFAULTS.items():
 def reset_for_inputs(
     template_hash: str,
     attendance_hash: str,
+    daily_punch_hash: str,
     leave_hash: str,
 ):
     if (
