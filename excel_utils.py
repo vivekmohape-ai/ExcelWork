@@ -908,7 +908,510 @@ def parse_attendance_input(
         )
 
     return month_year, records
+def parse_daily_punch_report(
+    file_content: Any,
+    filename: Optional[str] = None,
+):
+    """
+    Parse ESSL Daily Attendance Report / Summary Report.
 
+    The report contains repeated employee blocks such as:
+
+        Employee Code: 12
+        Employee Name: Prince Chande
+
+        Date        InTime   OutTime   Status
+        05-Aug-2026 11:21             Absent
+
+    Business rule:
+        If either InTime OR OutTime exists for an employee/date,
+        that date is considered PRESENT.
+
+    Returns:
+        month_year,
+        {
+            employee_id: {
+                "name": employee_name,
+                "punch_dates": set(...),
+                "punch_details": {
+                    date: {
+                        "in_time": ...,
+                        "out_time": ...,
+                    }
+                },
+            }
+        }
+    """
+
+    if hasattr(file_content, "seek"):
+        file_content.seek(0)
+
+    if isinstance(
+        file_content,
+        (bytes, bytearray),
+    ):
+        file_content = io.BytesIO(
+            file_content
+        )
+
+    try:
+        xls = pd.ExcelFile(
+            file_content
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Could not read the Daily Attendance Report. "
+            "For .xls files, make sure xlrd>=2.0.1 is installed."
+        ) from exc
+
+    employees: Dict[str, Dict[str, Any]] = {}
+    detected_dates: List[pd.Timestamp] = []
+
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(
+            xls,
+            sheet_name=sheet_name,
+            header=None,
+        )
+
+        if df.empty:
+            continue
+
+        current_employee_id = ""
+        current_employee_name = ""
+
+        for row_idx in range(
+            len(df)
+        ):
+            row = df.iloc[row_idx]
+
+            values = [
+                value
+                for value in row.tolist()
+                if pd.notna(value)
+                and str(value).strip()
+            ]
+
+            if not values:
+                continue
+
+            normalized_values = [
+                _normalize_header(value)
+                for value in values
+            ]
+
+            # --------------------------------------------------------
+            # Detect employee header row
+            # --------------------------------------------------------
+
+            employee_code_index = None
+            employee_name_index = None
+
+            for index, value in enumerate(
+                normalized_values
+            ):
+                if value == "employee code":
+                    employee_code_index = index
+
+                elif value == "employee name":
+                    employee_name_index = index
+
+            if employee_code_index is not None:
+                code_value = None
+
+                if (
+                    employee_code_index + 1
+                    < len(values)
+                ):
+                    code_value = values[
+                        employee_code_index + 1
+                    ]
+
+                employee_id = (
+                    _normalize_employee_id_local(
+                        code_value
+                    )
+                )
+
+                name_value = None
+
+                if employee_name_index is not None:
+                    if (
+                        employee_name_index + 1
+                        < len(values)
+                    ):
+                        name_value = values[
+                            employee_name_index + 1
+                        ]
+
+                employee_name = (
+                    str(name_value).strip()
+                    if name_value is not None
+                    else ""
+                )
+
+                if employee_id:
+                    current_employee_id = (
+                        employee_id
+                    )
+
+                    current_employee_name = (
+                        employee_name
+                    )
+
+                    employees.setdefault(
+                        employee_id,
+                        {
+                            "name": employee_name,
+                            "punch_dates": set(),
+                            "punch_details": {},
+                        },
+                    )
+
+                    if employee_name:
+                        employees[
+                            employee_id
+                        ]["name"] = employee_name
+
+                continue
+
+            # --------------------------------------------------------
+            # Ignore rows before an employee block
+            # --------------------------------------------------------
+
+            if not current_employee_id:
+                continue
+
+            # --------------------------------------------------------
+            # The Daily Attendance Report has:
+            #
+            # col 0 = Date
+            # col 2 = InTime
+            # col 3 = OutTime
+            #
+            # We deliberately use positional detection because the
+            # report repeats these headers for every employee.
+            # --------------------------------------------------------
+
+            if len(row) < 4:
+                continue
+
+            raw_date = row.iloc[0]
+
+            parsed_date = pd.to_datetime(
+                raw_date,
+                errors="coerce",
+            )
+
+            if pd.isna(parsed_date):
+                continue
+
+            parsed_date = pd.Timestamp(
+                parsed_date
+            ).normalize()
+
+            in_time = row.iloc[2]
+            out_time = row.iloc[3]
+
+            has_in_time = (
+                pd.notna(in_time)
+                and str(in_time).strip() != ""
+            )
+
+            has_out_time = (
+                pd.notna(out_time)
+                and str(out_time).strip() != ""
+            )
+
+            # --------------------------------------------------------
+            # Critical rule:
+            #
+            # InTime OR OutTime = PRESENT
+            # --------------------------------------------------------
+
+            if not (
+                has_in_time
+                or has_out_time
+            ):
+                continue
+
+            date_key = parsed_date.strftime(
+                "%Y-%m-%d"
+            )
+
+            employees[
+                current_employee_id
+            ]["punch_dates"].add(
+                date_key
+            )
+
+            employees[
+                current_employee_id
+            ]["punch_details"][
+                date_key
+            ] = {
+                "in_time": (
+                    str(in_time).strip()
+                    if has_in_time
+                    else ""
+                ),
+                "out_time": (
+                    str(out_time).strip()
+                    if has_out_time
+                    else ""
+                ),
+                "source_sheet": sheet_name,
+            }
+
+            detected_dates.append(
+                parsed_date
+            )
+
+    if not employees:
+        raise ValueError(
+            "No employee punch records were found "
+            "in the Daily Attendance Report."
+        )
+
+    month_year = None
+
+    if detected_dates:
+        first_date = min(
+            detected_dates
+        )
+
+        month_year = (
+            f"{first_date.strftime('%B')} "
+            f"{first_date.year}"
+        )
+
+    return (
+        month_year,
+        employees,
+    )
+
+
+def apply_daily_punch_corrections(
+    attendance_records: List[Dict[str, Any]],
+    punch_records: Dict[str, Dict[str, Any]],
+):
+    """
+    Correct ESSL attendance using the Daily Attendance Report.
+
+    Only positive corrections are made.
+
+    If Basic ESSL says:
+        A / blank / half-day
+
+    but the Daily Attendance Report contains:
+        InTime OR OutTime
+
+    then that date becomes PRESENT.
+
+    Existing PRESENT dates are never counted twice.
+
+    Dates already included in the ESSL Payroll Present Days
+    through the extractor's payroll-paid-date policy are also
+    not counted twice.
+
+    Returns a summary dictionary.
+    """
+
+    corrected_employees = 0
+    corrected_days = 0
+    already_present = 0
+    unmatched_punch_ids = 0
+    correction_details = []
+
+    for record in attendance_records:
+        employee_id = _normalize_employee_id_local(
+            record.get("employee_id")
+        )
+
+        if not employee_id:
+            continue
+
+        punch_record = punch_records.get(
+            employee_id
+        )
+
+        if punch_record is None:
+            unmatched_punch_ids += 1
+            record[
+                "punch_correction_count"
+            ] = 0
+            record[
+                "punch_correction_dates"
+            ] = []
+            continue
+
+        existing_present_dates = set(
+            record.get(
+                "present_dates",
+                [],
+            )
+            or []
+        )
+
+        existing_half_dates = set(
+            record.get(
+                "half_present_dates",
+                [],
+            )
+            or []
+        )
+
+        # These dates are already included in the payroll
+        # attendance calculation by the ESSL Extractor.
+        payroll_paid_dates = set(
+            record.get(
+                "payroll_paid_dates",
+                [],
+            )
+            or []
+        )
+
+        employee_corrections = []
+
+        for date_key in sorted(
+            punch_record.get(
+                "punch_dates",
+                set(),
+            )
+        ):
+
+            # Already a full PRESENT date.
+            if date_key in existing_present_dates:
+                already_present += 1
+                continue
+
+            # Already included through the payroll calendar
+            # policy, so adding it again would double count.
+            if date_key in payroll_paid_dates:
+                already_present += 1
+                continue
+
+            # Convert half-day to full present.
+            if date_key in existing_half_dates:
+                delta = 0.5
+                existing_half_dates.remove(
+                    date_key
+                )
+            else:
+                delta = 1.0
+
+            existing_present_dates.add(
+                date_key
+            )
+
+            detail = (
+                punch_record.get(
+                    "punch_details",
+                    {},
+                ).get(
+                    date_key,
+                    {},
+                )
+            )
+
+            employee_corrections.append(
+                {
+                    "date": date_key,
+                    "in_time": detail.get(
+                        "in_time",
+                        "",
+                    ),
+                    "out_time": detail.get(
+                        "out_time",
+                        "",
+                    ),
+                    "reason": (
+                        "InTime or OutTime exists"
+                    ),
+                }
+            )
+
+            record[
+                "essl_present_days"
+            ] = float(
+                record.get(
+                    "essl_present_days",
+                    0,
+                )
+                or 0
+            ) + delta
+
+            record[
+                "payroll_present_days"
+            ] = float(
+                record.get(
+                    "payroll_present_days",
+                    record.get(
+                        "days_present",
+                        0,
+                    ),
+                )
+                or 0
+            ) + delta
+
+            record[
+                "days_present"
+            ] = record[
+                "payroll_present_days"
+            ]
+
+            corrected_days += delta
+
+        record[
+            "present_dates"
+        ] = sorted(
+            existing_present_dates
+        )
+
+        record[
+            "half_present_dates"
+        ] = sorted(
+            existing_half_dates
+        )
+
+        record[
+            "punch_correction_count"
+        ] = len(
+            employee_corrections
+        )
+
+        record[
+            "punch_correction_dates"
+        ] = [
+            item["date"]
+            for item in employee_corrections
+        ]
+
+        record[
+            "punch_correction_details"
+        ] = employee_corrections
+
+        if employee_corrections:
+            corrected_employees += 1
+
+            correction_details.append(
+                {
+                    "employee_id": employee_id,
+                    "name": record.get(
+                        "name",
+                        "",
+                    ),
+                    "corrections": employee_corrections,
+                }
+            )
+
+    return {
+        "employees_corrected": corrected_employees,
+        "days_corrected": corrected_days,
+        "already_present_or_paid": already_present,
+        "unmatched_employee_ids": unmatched_punch_ids,
+        "details": correction_details,
+    }
 
 def _leave_name_normalized(
     value: Any,
