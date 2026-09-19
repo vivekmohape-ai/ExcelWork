@@ -83,6 +83,7 @@ def reset_for_inputs(
     ):
         st.session_state.template_hash = template_hash
         st.session_state.attendance_hash = attendance_hash
+        st.session_state.daily_punch_hash = daily_punch_hash
         st.session_state.leave_hash = leave_hash
         st.session_state.mapping_state = {}
         st.session_state.new_hires = []
@@ -118,8 +119,19 @@ with st.sidebar:
         ),
     )
 
+    daily_punch_file = st.file_uploader(
+        "3. Daily Attendance Report for punch verification",
+        type=["xlsx", "xls"],
+        key="daily_punch_file",
+        help=(
+            "Optional ESSL Daily Attendance Report. "
+            "If either InTime or OutTime exists for an employee/date, "
+            "that date is corrected to Present."
+        ),
+    )
+
     leave_file = st.file_uploader(
-        "3. Leave / Comp Off report",
+        "4. Leave / Comp Off report",
         type=["xlsx", "xls"],
         key="leave_file",
         help=(
@@ -146,11 +158,17 @@ if (
 
 template_hash = sha256_bytes(template_file)
 attendance_hash = sha256_bytes(attendance_file)
+daily_punch_hash = (
+    sha256_bytes(daily_punch_file)
+    if daily_punch_file is not None
+    else ""
+)
 leave_hash = sha256_bytes(leave_file)
 
 reset_for_inputs(
     template_hash,
     attendance_hash,
+    daily_punch_hash,
     leave_hash,
 )
 
@@ -166,6 +184,47 @@ try:
 except Exception as exc:
     st.error(f"Could not read attendance workbook: {exc}")
     st.stop()
+
+# ------------------------------------------------------------
+# Daily Attendance / Punch correction
+# ------------------------------------------------------------
+
+punch_summary = {
+    "employees_corrected": 0,
+    "days_corrected": 0,
+    "already_present_or_paid": 0,
+    "unmatched_employee_ids": 0,
+    "details": [],
+}
+
+if daily_punch_file is not None:
+    try:
+        punch_month, punch_records = parse_daily_punch_report(
+            daily_punch_file,
+            filename=daily_punch_file.name,
+        )
+
+        if (
+            attendance_month
+            and punch_month
+            and attendance_month.lower() != punch_month.lower()
+        ):
+            st.error(
+                "Attendance and Daily Attendance Report are for different months: "
+                f"{attendance_month} vs {punch_month}."
+            )
+            st.stop()
+
+        punch_summary = apply_daily_punch_corrections(
+            attendance_records,
+            punch_records,
+        )
+
+    except Exception as exc:
+        st.error(
+            f"Could not read Daily Attendance Report: {exc}"
+        )
+        st.stop()
 
 attendance_issues = validate_attendance_records(
     attendance_records
@@ -296,7 +355,7 @@ st.session_state.leave_summary = leave_summary
 # Run summary
 # ------------------------------------------------------------
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 c1.metric(
     "Attendance Records",
@@ -304,25 +363,66 @@ c1.metric(
 )
 
 c2.metric(
+    "Punch Corrections",
+    int(punch_summary["days_corrected"]),
+)
+
+c3.metric(
     "Leave Records",
     len(leave_records),
 )
 
-c3.metric(
+c4.metric(
     "Active Payroll Sheets",
     len(active_sheets),
 )
 
-c4.metric(
+c5.metric(
     "Days in Month",
     total_days,
 )
+
+if daily_punch_file is not None:
+    st.caption(
+        f"Daily punch verification: "
+        f"{punch_summary['employees_corrected']} employee(s) corrected | "
+        f"{punch_summary['days_corrected']} day(s) changed to Present | "
+        f"{punch_summary['already_present_or_paid']} already Present/paid dates not double-counted."
+    )
+else:
+    st.caption(
+        "Daily punch verification report not uploaded. "
+        "ESSL attendance is being used without punch correction."
+    )
 
 st.caption(
     f"Leave matched: {leave_summary['matched']} | "
     f"Leave adjusted: {leave_summary['adjusted']} | "
     f"Leave unmatched/review: {leave_summary['unmatched']}"
 )
+
+if punch_summary["details"]:
+    with st.expander("View Daily Punch Corrections"):
+        correction_rows = []
+        for item in punch_summary["details"]:
+            for correction in item["corrections"]:
+                correction_rows.append(
+                    {
+                        "ESSL ID": item["employee_id"],
+                        "Employee": item["name"],
+                        "Date": correction["date"],
+                        "InTime": correction["in_time"],
+                        "OutTime": correction["out_time"],
+                        "Reason": correction["reason"],
+                    }
+                )
+
+        if correction_rows:
+            st.dataframe(
+                pd.DataFrame(correction_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 attendance_by_id, _ = build_attendance_indexes(
     attendance_records
@@ -768,8 +868,9 @@ with tab3:
             "Generating payroll workbook..."
         ):
             try:
-                # Make absolutely sure the values used by payroll
-                # are the latest leave-reconciled values.
+                # Daily punch corrections have already been applied to
+                # attendance_records before identity mapping. Make absolutely
+                # sure the values used by payroll are the latest leave-reconciled values.
                 apply_leave_adjustments(
                     mappings,
                     leave_records,
