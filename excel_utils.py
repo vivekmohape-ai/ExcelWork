@@ -763,7 +763,7 @@ def parse_attendance_input(
                 payroll_unpaid_absent_dates = (
                     str(value).strip()
                 )
-                        payroll_paid_dates = []
+        payroll_paid_dates = []
 
         if (
             payroll_paid_dates_col is not None
@@ -1269,7 +1269,7 @@ def apply_daily_punch_corrections(
 
     corrected_employees = 0
     corrected_days = 0
-    already_present = 0
+    already_counted = 0
     unmatched_punch_ids = 0
     correction_details = []
 
@@ -1332,13 +1332,13 @@ def apply_daily_punch_corrections(
 
             # Already a full PRESENT date.
             if date_key in existing_present_dates:
-                already_present += 1
+                already_counted += 1
                 continue
 
             # Already included through the payroll calendar
             # policy, so adding it again would double count.
             if date_key in payroll_paid_dates:
-                already_present += 1
+                already_counted += 1
                 continue
 
             # Convert half-day to full present.
@@ -1458,7 +1458,7 @@ def apply_daily_punch_corrections(
     return {
         "employees_corrected": corrected_employees,
         "days_corrected": corrected_days,
-        "already_present_or_paid": already_present,
+        "already_present_or_paid": already_counted,
         "unmatched_employee_ids": unmatched_punch_ids,
         "details": correction_details,
     }
