@@ -1030,6 +1030,14 @@ def parse_daily_punch_report(
         current_employee_id = ""
         current_employee_name = ""
 
+        # ESSL Daily Attendance Report column positions can contain
+        # leading blank columns. Detect the repeated table header instead
+        # of assuming Date is column 0.
+        date_col = 1
+        in_time_col = 3
+        out_time_col = 4
+        status_col = 7
+
         for row_idx in range(
             len(df)
         ):
@@ -1049,6 +1057,42 @@ def parse_daily_punch_report(
                 _normalize_header(value)
                 for value in values
             ]
+
+            # --------------------------------------------------------
+            # Detect repeated Daily Attendance table header
+            # --------------------------------------------------------
+
+            header_positions = {
+                value: index
+                for index, value in enumerate(
+                    normalized_values
+                )
+            }
+
+            if (
+                "date" in header_positions
+                and "intime" in header_positions
+                and "outtime" in header_positions
+                and "status" in header_positions
+            ):
+                # normalized_values is built from non-empty cells, so
+                # these indices are not necessarily the original DataFrame
+                # column positions. Resolve them against the raw row.
+                for raw_index, raw_value in enumerate(
+                    row.tolist()
+                ):
+                    normalized = _normalize_header(raw_value)
+
+                    if normalized == "date":
+                        date_col = raw_index
+                    elif normalized == "intime":
+                        in_time_col = raw_index
+                    elif normalized == "outtime":
+                        out_time_col = raw_index
+                    elif normalized == "status":
+                        status_col = raw_index
+
+                continue
 
             # --------------------------------------------------------
             # Detect employee header row
@@ -1115,6 +1159,7 @@ def parse_daily_punch_report(
                             "name": employee_name,
                             "punch_dates": set(),
                             "punch_details": {},
+                            "attendance_statuses": {},
                         },
                     )
 
@@ -1133,20 +1178,18 @@ def parse_daily_punch_report(
                 continue
 
             # --------------------------------------------------------
-            # The Daily Attendance Report has:
-            #
-            # col 0 = Date
-            # col 2 = InTime
-            # col 3 = OutTime
-            #
-            # We deliberately use positional detection because the
-            # report repeats these headers for every employee.
+            # Read the date / punch columns discovered from the ESSL
+            # repeated table header.
             # --------------------------------------------------------
 
-            if len(row) < 4:
+            if (
+                date_col >= len(row)
+                or in_time_col >= len(row)
+                or out_time_col >= len(row)
+            ):
                 continue
 
-            raw_date = row.iloc[0]
+            raw_date = row.iloc[date_col]
 
             parsed_date = pd.to_datetime(
                 raw_date,
@@ -1160,8 +1203,29 @@ def parse_daily_punch_report(
                 parsed_date
             ).normalize()
 
-            in_time = row.iloc[2]
-            out_time = row.iloc[3]
+            in_time = row.iloc[in_time_col]
+            out_time = row.iloc[out_time_col]
+
+            raw_status = (
+                row.iloc[status_col]
+                if status_col < len(row)
+                else ""
+            )
+            status_text = (
+                str(raw_status).strip()
+                if pd.notna(raw_status)
+                else ""
+            )
+
+            date_key = parsed_date.strftime(
+                "%Y-%m-%d"
+            )
+
+            employees[
+                current_employee_id
+            ]["attendance_statuses"][
+                date_key
+            ] = status_text
 
             has_in_time = (
                 pd.notna(in_time)
@@ -1184,10 +1248,6 @@ def parse_daily_punch_report(
                 or has_out_time
             ):
                 continue
-
-            date_key = parsed_date.strftime(
-                "%Y-%m-%d"
-            )
 
             employees[
                 current_employee_id
@@ -1462,6 +1522,335 @@ def apply_daily_punch_corrections(
         "unmatched_employee_ids": unmatched_punch_ids,
         "details": correction_details,
     }
+
+
+def _policy_paid_dates_for_period(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> List[str]:
+    """
+    Return payroll policy dates for the active period.
+
+    Policy:
+        * Every Sunday is paid.
+        * 2nd Saturday is paid.
+        * 4th Saturday is paid.
+        * Public holidays are paid.
+        * A date is returned only once.
+
+    The 2026 holiday list is the holiday calendar supplied for this
+    payroll workflow. Future years can be extended here without changing
+    the Daily Attendance parser.
+    """
+    public_holidays = {
+        "2026-01-01",
+        "2026-01-26",
+        "2026-03-04",
+        "2026-03-19",
+        "2026-05-01",
+        "2026-08-15",
+        "2026-08-28",
+        "2026-09-14",
+        "2026-10-02",
+        "2026-10-20",
+        "2026-11-11",
+        "2026-12-25",
+    }
+
+    paid_dates = set()
+
+    current = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    while current <= end:
+        weekday = current.weekday()  # Monday=0, Sunday=6
+
+        if weekday == 6:
+            paid_dates.add(current.strftime("%Y-%m-%d"))
+
+        elif weekday == 5:
+            # Saturday occurrence within its calendar month.
+            occurrence = ((current.day - 1) // 7) + 1
+
+            if occurrence in {2, 4}:
+                paid_dates.add(current.strftime("%Y-%m-%d"))
+
+        date_key = current.strftime("%Y-%m-%d")
+
+        if date_key in public_holidays:
+            paid_dates.add(date_key)
+
+        current += pd.Timedelta(days=1)
+
+    return sorted(paid_dates)
+
+
+def parse_daily_attendance_input(
+    file_content: Any,
+    filename: Optional[str] = None,
+):
+    """
+    Build payroll attendance directly from the ESSL Daily Attendance Report.
+
+    This is the primary attendance input for Payroll Automator.
+
+    Business rule:
+        If either InTime OR OutTime exists for an employee/date,
+        the date is Present.
+
+    Payroll calendar policy:
+        * Every Sunday is paid.
+        * 2nd Saturday is paid.
+        * 4th Saturday is paid.
+        * Public holidays are paid.
+        * Policy dates are counted only once even if a punch exists.
+
+    The Daily Attendance Report does not contain a reliable joining-date
+    field in the supplied ESSL format. For payroll-calendar purposes,
+    the first date on which the employee has an InTime or OutTime is
+    treated as the active-from date. Active-to is the last day of the
+    report month.
+
+    Returns:
+        month_year, attendance_records
+    """
+    month_year, punch_records = parse_daily_punch_report(
+        file_content,
+        filename=filename,
+    )
+
+    if not month_year:
+        raise ValueError(
+            "Could not determine the month from the Daily Attendance Report."
+        )
+
+    month_match = MONTH_PATTERN.search(str(month_year))
+    if not month_match:
+        raise ValueError(
+            f"Could not determine month/year from Daily Attendance Report: {month_year}"
+        )
+
+    month_aliases = {
+        "jan": "january",
+        "feb": "february",
+        "mar": "march",
+        "apr": "april",
+        "may": "may",
+        "jun": "june",
+        "jul": "july",
+        "aug": "august",
+        "sep": "september",
+        "sept": "september",
+        "oct": "october",
+        "nov": "november",
+        "dec": "december",
+    }
+
+    month_name = month_aliases.get(
+        month_match.group(1).lower(),
+        month_match.group(1).lower(),
+    )
+
+    month_number = list(calendar.month_name).index(
+        month_name.capitalize()
+    )
+    year_number = int(month_match.group(2))
+
+    month_start = pd.Timestamp(
+        date(year_number, month_number, 1)
+    )
+    month_end = pd.Timestamp(
+        date(
+            year_number,
+            month_number,
+            calendar.monthrange(
+                year_number,
+                month_number,
+            )[1],
+        )
+    )
+
+    records: List[Dict[str, Any]] = []
+
+    for employee_id, employee in punch_records.items():
+        name = str(employee.get("name") or "").strip()
+
+        if not _valid_attendance_row(
+            _normalize_employee_id_local(employee_id),
+            name,
+        ):
+            continue
+
+        punch_dates = {
+            str(value)
+            for value in employee.get(
+                "punch_dates",
+                set(),
+            )
+        }
+
+        punch_dates = {
+            value
+            for value in punch_dates
+            if (
+                pd.notna(
+                    pd.to_datetime(
+                        value,
+                        errors="coerce",
+                    )
+                )
+                and month_start
+                <= pd.Timestamp(value)
+                <= month_end
+            )
+        }
+
+        attendance_statuses = {
+            str(key): str(value or "").strip().lower()
+            for key, value in employee.get(
+                "attendance_statuses",
+                {},
+            ).items()
+        }
+
+        # ESSL supplies a daily status for every calendar date. Treat the
+        # first date that is not a WeeklyOff as the active-from date. This
+        # preserves dates such as an employee's first-day Absent record,
+        # while still avoiding policy credits before the first actual
+        # activity when the report only contains WeeklyOff rows.
+        active_candidates = [
+            pd.Timestamp(key)
+            for key, status in attendance_statuses.items()
+            if status
+            and status not in {
+                "weeklyoff",
+                "weekly off",
+                "wo",
+            }
+        ]
+
+        if active_candidates:
+            active_from_date = min(
+                active_candidates
+            ).normalize()
+        elif punch_dates:
+            active_from_date = min(
+                pd.Timestamp(value)
+                for value in punch_dates
+            ).normalize()
+        else:
+            active_from_date = None
+
+        present_dates = sorted(punch_dates)
+
+        policy_paid_dates = []
+        if active_from_date is not None:
+            policy_paid_dates = _policy_paid_dates_for_period(
+                active_from_date,
+                month_end,
+            )
+
+        payroll_paid_date_set = (
+            set(present_dates)
+            | set(policy_paid_dates)
+        )
+
+        payroll_paid_dates = sorted(
+            payroll_paid_date_set
+        )
+
+        active_start = (
+            active_from_date
+            if active_from_date is not None
+            else None
+        )
+
+        if active_start is None:
+            payroll_unpaid_absent_dates = []
+            absent_dates = []
+        else:
+            all_active_dates = pd.date_range(
+                active_start,
+                month_end,
+                freq="D",
+            )
+
+            present_set = set(
+                present_dates
+            )
+            policy_set = set(
+                policy_paid_dates
+            )
+
+            payroll_unpaid_absent_dates = [
+                current.strftime("%Y-%m-%d")
+                for current in all_active_dates
+                if (
+                    current.strftime("%Y-%m-%d")
+                    not in present_set
+                    and current.strftime("%Y-%m-%d")
+                    not in policy_set
+                    and current.weekday() < 5
+                )
+            ]
+
+            absent_dates = [
+                current.strftime("%Y-%m-%d")
+                for current in all_active_dates
+                if current.strftime("%Y-%m-%d")
+                not in present_set
+            ]
+
+        records.append(
+            {
+                "employee_id": _normalize_employee_id_local(
+                    employee_id
+                ),
+                "name": name,
+                "days_present": float(
+                    len(payroll_paid_dates)
+                ),
+                "essl_present_days": float(
+                    len(present_dates)
+                ),
+                "payroll_present_days": float(
+                    len(payroll_paid_dates)
+                ),
+                "absent_count": float(
+                    len(absent_dates)
+                ),
+                "payroll_unpaid_absent_days": float(
+                    len(payroll_unpaid_absent_dates)
+                ),
+                "payroll_paid_dates": payroll_paid_dates,
+                "absent_days": ", ".join(
+                    absent_dates
+                ),
+                "payroll_unpaid_absent_dates": ", ".join(
+                    payroll_unpaid_absent_dates
+                ),
+                "active_from": (
+                    int(active_from_date.day)
+                    if active_from_date is not None
+                    else None
+                ),
+                "active_to": (
+                    int(month_end.day)
+                    if active_from_date is not None
+                    else None
+                ),
+                "present_dates": present_dates,
+                "half_present_dates": [],
+            }
+        )
+
+    if not records:
+        raise ValueError(
+            "No valid employee attendance records were found "
+            "in the Daily Attendance Report."
+        )
+
+    return month_year, records
 
 def _leave_name_normalized(
     value: Any,
