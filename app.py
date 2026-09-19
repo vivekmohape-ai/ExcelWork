@@ -78,6 +78,7 @@ def reset_for_inputs(
     if (
         template_hash != st.session_state.template_hash
         or attendance_hash != st.session_state.attendance_hash
+        or daily_punch_hash != st.session_state.daily_punch_hash
         or leave_hash != st.session_state.leave_hash
     ):
         st.session_state.template_hash = template_hash
